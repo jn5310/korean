@@ -1,0 +1,14 @@
+# GUI
+PyQt6>=6.5
+
+# AI (Google Gen AI SDK — 구 google-generativeai 는 지원 종료됨)
+google-genai>=1.0
+
+# PDF 처리 & OCR (Step 2)
+pdfplumber>=0.11
+pypdf>=4.0
+pytesseract>=0.3.10
+Pillow>=10.0
+
+# PDF 생성 (Step 5)
+reportlab>=4.0
