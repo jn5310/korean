@@ -12,7 +12,9 @@ from PyQt6.QtWidgets import (
     QListWidgetItem, QMessageBox, QProgressBar, QPushButton, QVBoxLayout, QWidget,
 )
 
-from ..services.analysis_pipeline import AnalysisBatchResult, AnalysisPipeline, passages_equivalent
+from ..services.analysis_pipeline import (
+    AnalysisBatchResult, AnalysisPipeline, merge_rich_content, passages_equivalent,
+)
 from ..services.difficulty import DifficultyClassifier
 from ..services.document_analyzer import GeminiDocumentAnalyzer
 from ..services.gemini_client import ConnectionTestResult, GeminiClient, GeminiError
@@ -222,6 +224,16 @@ class DashboardView(QWidget):
 
     def _on_test_result(self, result: ConnectionTestResult) -> None:
         if result.ok:
+            if (
+                result.model_changed
+                and result.model
+                and self.state.config.gemini_model == result.original_model
+            ):
+                self.state.config.gemini_model = result.model
+                try:
+                    self.state.save_config()
+                except OSError as exc:
+                    QMessageBox.warning(self, "모델 저장 실패", str(exc))
             self.state.status(result.message, 6000)
             QMessageBox.information(self, "연결 테스트", result.message)
         else:
@@ -290,9 +302,11 @@ class DashboardView(QWidget):
                 cfg.ocr_languages,
                 cfg.ocr_dpi,
                 ocr_timeout_sec=getattr(cfg, "ocr_timeout_sec", 90),
+                asset_store=self.state.asset_store,
             )
             analyzer = None
             classifier = None
+            client = None
             setup_warning = ""
             if api_key:
                 try:
@@ -315,6 +329,10 @@ class DashboardView(QWidget):
             batch = pipeline.analyze_files(files, progress=progress)
             if setup_warning:
                 batch.general_warnings.append(setup_warning)
+            if client is not None:
+                batch.selected_model = client.model
+                batch.original_model = cfg.gemini_model
+                batch.model_changed = client.model != cfg.gemini_model
             return batch
 
         self._set_analysis_busy(True, len(files) * 1000)
@@ -349,11 +367,19 @@ class DashboardView(QWidget):
     def _on_analysis_done(self, batch: AnalysisBatchResult) -> None:
         known_passages = list(self.state.library.passages)
         added_passages = []
+        enriched_passages = []
         duplicate_count = 0
         for result in batch.results:
             for passage in result.passages:
-                if any(passages_equivalent(existing, passage) for existing in known_passages):
-                    duplicate_count += 1
+                existing = next(
+                    (item for item in known_passages if passages_equivalent(item, passage)),
+                    None,
+                )
+                if existing is not None:
+                    if merge_rich_content(existing, passage):
+                        enriched_passages.append(existing)
+                    else:
+                        duplicate_count += 1
                     continue
                 known_passages.append(passage)
                 self.state.library.add_passage(passage)
@@ -368,16 +394,27 @@ class DashboardView(QWidget):
         self._rebuild_file_list()
 
         warnings = list(batch.warnings)
+        model_changed = bool(batch.model_changed and batch.selected_model)
+        if model_changed and self.state.config.gemini_model == batch.original_model:
+            previous = self.state.config.gemini_model
+            self.state.config.gemini_model = batch.selected_model
+            warnings.append(
+                f"기존 Gemini 모델({previous})을 사용할 수 없어 {batch.selected_model}로 자동 변경했습니다."
+            )
+        elif model_changed and self.state.config.gemini_model != batch.original_model:
+            warnings.append("분석 중 사용자가 변경한 Gemini 모델 설정을 유지했습니다.")
+            model_changed = False
         if duplicate_count:
             warnings.append(f"이미 라이브러리에 있는 중복 지문 {duplicate_count}개는 추가하지 않았습니다.")
 
-        if batch.results:
+        if batch.results or model_changed:
             try:
-                self.state.config_manager.save()
+                self.state.save_config()
             except OSError as exc:
-                warnings.append(f"최근 파일 설정 저장 실패: {exc}")
+                warnings.append(f"최근 파일/모델 설정 저장 실패: {exc}")
 
-        if added_passages:
+        changed_passages = [*added_passages, *enriched_passages]
+        if changed_passages:
             self.state.mark_dirty()
             try:
                 self.state.save_library()  # 분석 직후 자동 저장하여 결과 유실 방지
@@ -385,7 +422,7 @@ class DashboardView(QWidget):
                 warnings.append(f"자동 저장 실패: {exc}. Ctrl+S로 다시 저장해 주세요.")
             question_count = sum(len(passage.questions) for passage in added_passages)
             self.state.status(
-                f"분석 완료: 지문 {len(added_passages)}개, 문제 {question_count}개",
+                f"분석 완료: 새 지문 {len(added_passages)}개, 서식 보강 {len(enriched_passages)}개, 문제 {question_count}개",
                 7000,
             )
         elif batch.failures:
@@ -393,9 +430,11 @@ class DashboardView(QWidget):
         else:
             self.state.status("새로 추가할 지문이 없습니다.", 5000)
 
-        self._show_analysis_summary(batch, added_passages, duplicate_count, warnings)
-        if added_passages:
-            self.analysis_completed.emit(added_passages[0].id)
+        self._show_analysis_summary(
+            batch, added_passages, len(enriched_passages), duplicate_count, warnings
+        )
+        if changed_passages:
+            self.analysis_completed.emit(changed_passages[0].id)
 
     def _rebuild_file_list(self) -> None:
         self.file_list.clear()
@@ -409,6 +448,7 @@ class DashboardView(QWidget):
         self,
         batch: AnalysisBatchResult,
         added_passages: list,
+        enriched_count: int,
         duplicate_count: int,
         warnings: list[str],
     ) -> None:
@@ -421,13 +461,15 @@ class DashboardView(QWidget):
             QMessageBox.Icon.Warning if batch.failures or warnings else QMessageBox.Icon.Information
         )
         box.setText(
-            f"지문 {len(added_passages)}개와 문제 {question_count}개를 라이브러리에 추가했습니다."
+            f"새 지문 {len(added_passages)}개·문제 {question_count}개를 추가하고, "
+            f"기존 지문 {enriched_count}개의 서식·그림을 보강했습니다."
         )
         details = [
             f"성공 파일: {len(batch.results)}개",
             f"실패 파일: {len(batch.failures)}개",
             f"OCR 사용 페이지: {ocr_pages}개",
             f"Gemini 교차 분석 파일: {ai_files}개",
+            f"서식·그림 보강 지문: {enriched_count}개",
             f"중복 제외 지문: {duplicate_count}개",
         ]
         box.setInformativeText("\n".join(details))

@@ -2,29 +2,34 @@
 
 왼쪽  : 지문 리스트 (난이도 색상 태그, 필터/검색)
 가운데: 지문·문제 상세 편집
-오른쪽: 미리보기 (Step 5 에서 실제 PDF 레이아웃 미리보기로 교체 예정)
+오른쪽: 굵게·색상·밑줄·그림을 반영한 검수 미리보기
 """
 from __future__ import annotations
 
 import html
 from copy import deepcopy
+from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, QUrl
 from PyQt6.QtGui import QColor, QIcon, QPixmap
 from PyQt6.QtWidgets import (
-    QComboBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
-    QListWidgetItem, QMessageBox, QPlainTextEdit, QPushButton, QSplitter,
+    QComboBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel,
+    QLineEdit, QListWidget, QListWidgetItem, QMessageBox, QPlainTextEdit, QPushButton, QSplitter,
     QTextBrowser, QVBoxLayout, QWidget,
 )
 
+from ..assets import AssetError
 from ..config import DEFAULT_PASSAGE_TYPES, DEFAULT_QUESTION_TYPES, DIFFICULTY_LEVELS
 from ..models import Passage, Question
 from ..services.difficulty import DifficultyClassifier
 from ..services.gemini_client import GeminiError
 from .state import AppState
 from .styles import difficulty_color
-from .widgets import DifficultyCombo, difficulty_badge_html, make_type_combo
+from .widgets import (
+    DifficultyCombo, RichTextEdit, RichTextToolbar, difficulty_badge_html,
+    make_type_combo, sanitize_rich_html,
+)
 
 ROLE_ID = Qt.ItemDataRole.UserRole
 _ALL = "__all__"
@@ -36,21 +41,57 @@ def color_icon(color: str, size: int = 12) -> QIcon:
     return QIcon(pix)
 
 
-def passage_preview_html(p: Passage) -> str:
-    """간이 HTML 미리보기 — 1지문 1페이지 구성을 흉내낸다."""
-    esc = lambda s: html.escape(s or "").replace("\n", "<br>")  # noqa: E731
+def _rich_or_plain(plain: str, rich: str) -> str:
+    return sanitize_rich_html(rich) or html.escape(plain or "").replace("\n", "<br/>")
+
+
+def _asset_html(asset, asset_store) -> str:
+    path = asset_store.resolve(asset) if asset_store else None
+    if path is None:
+        return '<div style="color:#c62828;">[그림 파일을 찾을 수 없습니다]</div>'
+    width = asset.width or 500
+    height = asset.height or 300
+    display_width = min(520, max(80, width))
+    display_height = max(40, int(height * display_width / max(1, width)))
+    url = html.escape(QUrl.fromLocalFile(str(path)).toString(), quote=True)
+    alt = html.escape(asset.alt or "문제 그림", quote=True)
+    return (
+        f'<div style="margin:8px 0;text-align:center;"><img src="{url}" '
+        f'width="{display_width}" height="{display_height}" alt="{alt}"/></div>'
+    )
+
+
+def _images_html(images, asset_store, anchor: str | None = None) -> str:
+    selected = [asset for asset in images if anchor is None or asset.anchor == anchor]
+    return "".join(_asset_html(asset, asset_store) for asset in selected)
+
+
+def passage_preview_html(p: Passage, asset_store=None) -> str:
+    """제한된 리치 HTML과 관리 자산을 사용한 검수 미리보기."""
+    esc = lambda value: html.escape(value or "")  # noqa: E731
     parts = [
+        "<style>body{font-family:sans-serif;line-height:1.55;color:#202124;}"
+        ".passage{border:1px solid #cfd8dc;padding:10px;margin:8px 0;}"
+        ".question{margin-top:14px;padding-top:6px;border-top:1px solid #eceff1;}"
+        ".choice{margin:4px 0 4px 16px;}</style>",
         f"<h3>{esc(p.display_title)} {difficulty_badge_html(p.difficulty)}</h3>",
         f'<div style="color:#607d8b;">{esc(p.passage_type)}</div>' if p.passage_type else "",
-        f'<div style="border:1px solid #cfd8dc;padding:8px;margin:6px 0;line-height:150%;">{esc(p.text)}</div>',
+        f'<div class="passage">{_rich_or_plain(p.text, p.text_html)}</div>',
+        _images_html(p.images, asset_store),
     ]
-    for i, q in enumerate(p.questions, start=1):
-        number = q.number or str(i)
-        parts.append(f'<p style="margin-top:10px;"><b>{esc(number)}.</b> {esc(q.stem)} '
-                     f'{difficulty_badge_html(q.difficulty) if q.difficulty else ""}</p>')
-        if q.choices:
-            parts.append("<div style='margin-left:14px;'>" +
-                         "<br>".join(esc(c) for c in q.choices) + "</div>")
+    for index, question in enumerate(p.questions, start=1):
+        number = question.number or str(index)
+        parts.append(
+            f'<div class="question"><b>{esc(number)}.</b> '
+            f'{_rich_or_plain(question.stem, question.stem_html)} '
+            f'{difficulty_badge_html(question.difficulty) if question.difficulty else ""}</div>'
+        )
+        parts.append(_images_html(question.images, asset_store, "stem"))
+        for choice_index, choice in enumerate(question.choices):
+            rich = question.choices_html[choice_index] if choice_index < len(question.choices_html) else ""
+            parts.append(f'<div class="choice">{_rich_or_plain(choice, rich)}</div>')
+            parts.append(_images_html(question.images, asset_store, f"choice:{choice_index}"))
+        parts.append(_images_html(question.images, asset_store, "after"))
     return "".join(parts)
 
 
@@ -149,9 +190,13 @@ class EditorView(QWidget):
         form.addRow("출처", self.source_label)
         pl.addLayout(form)
 
-        self.text_edit = QPlainTextEdit()
+        self.text_edit = RichTextEdit()
         self.text_edit.setPlaceholderText("지문 본문을 입력/수정하세요.")
         self.text_edit.textChanged.connect(self._on_passage_edited)
+        self.passage_toolbar = RichTextToolbar(self.text_edit)
+        self.passage_toolbar.image_requested.connect(lambda: self._add_content_image("passage"))
+        self.passage_toolbar.remove_image_requested.connect(lambda: self._remove_content_image("passage"))
+        pl.addWidget(self.passage_toolbar)
         pl.addWidget(self.text_edit, 1)
         self.center.addWidget(pbox)
 
@@ -185,12 +230,20 @@ class EditorView(QWidget):
         qmeta.addWidget(QLabel("난이도"))
         qmeta.addWidget(self.q_diff)
         qf.addRow("번호", qmeta)
-        self.q_stem = QPlainTextEdit()
-        self.q_stem.setMaximumHeight(70)
+        self.q_stem = RichTextEdit()
+        self.q_stem.setMaximumHeight(80)
+        self.q_stem_toolbar = RichTextToolbar(self.q_stem)
+        self.q_stem_toolbar.image_requested.connect(lambda: self._add_content_image("stem"))
+        self.q_stem_toolbar.remove_image_requested.connect(lambda: self._remove_content_image("stem"))
+        qf.addRow("발문 서식", self.q_stem_toolbar)
         qf.addRow("발문", self.q_stem)
-        self.q_choices = QPlainTextEdit()
+        self.q_choices = RichTextEdit()
         self.q_choices.setPlaceholderText("한 줄에 선택지 하나 (예: ① …)")
-        self.q_choices.setMaximumHeight(110)
+        self.q_choices.setMaximumHeight(130)
+        self.q_choices_toolbar = RichTextToolbar(self.q_choices)
+        self.q_choices_toolbar.image_requested.connect(self._add_choice_image)
+        self.q_choices_toolbar.remove_image_requested.connect(lambda: self._remove_content_image("choices"))
+        qf.addRow("선택지 서식", self.q_choices_toolbar)
         qf.addRow("선택지", self.q_choices)
         self.q_answer = QLineEdit()
         qf.addRow("정답", self.q_answer)
@@ -217,8 +270,10 @@ class EditorView(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(QLabel("<b>미리보기</b>"))
         self.preview = QTextBrowser()
+        self.preview.setOpenLinks(False)
+        self.preview.setOpenExternalLinks(False)
         lay.addWidget(self.preview, 1)
-        note = QLabel("※ 실제 PDF 페이지 레이아웃 미리보기는 Step 5 에서 제공됩니다.")
+        note = QLabel("※ PDF 원본 서식·그림을 반영한 검수용 미리보기입니다. 최종 페이지 나눔은 PDF 내보내기 결과에서 확인하세요.")
         note.setObjectName("Muted")
         note.setWordWrap(True)
         lay.addWidget(note)
@@ -294,7 +349,7 @@ class EditorView(QWidget):
         self.title_edit.setText(p.title if p else "")
         self.ptype_combo.setCurrentText(p.passage_type if p else "")
         self.pdiff_combo.set_value(p.difficulty if p else None)
-        self.text_edit.setPlainText(p.text if p else "")
+        self.text_edit.set_content(p.text, p.text_html) if p else self.text_edit.set_content("", "")
         if p and p.source_file:
             pages = ", ".join(map(str, p.source_pages))
             self.source_label.setText(f"{p.source_file}" + (f" (p.{pages})" if pages else ""))
@@ -314,7 +369,8 @@ class EditorView(QWidget):
         p = self._current
         p.title = self.title_edit.text()
         p.passage_type = self.ptype_combo.currentText().strip()
-        p.text = self.text_edit.toPlainText()
+        p.text = self.text_edit.plain_projection()
+        p.text_html = self.text_edit.safe_html()
         p.touch()
         self._after_edit()
 
@@ -323,6 +379,66 @@ class EditorView(QWidget):
             return
         self._current.difficulty = self.pdiff_combo.value()
         self._current.difficulty_source = "manual"
+        self._current.touch()
+        self._after_edit()
+
+    def _add_content_image(self, anchor: str) -> None:
+        if not self._current or (anchor != "passage" and not self._current_q):
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "그림 추가",
+            "",
+            "이미지 파일 (*.png *.jpg *.jpeg *.webp)",
+        )
+        if not path:
+            return
+        try:
+            asset = self.state.asset_store.import_file(Path(path), anchor=anchor)
+        except AssetError as exc:
+            QMessageBox.warning(self, "그림 추가 실패", str(exc))
+            return
+        if anchor == "passage":
+            self._current.images.append(asset)
+        else:
+            self._current_q.images.append(asset)
+        self._current.touch()
+        self._after_edit()
+
+    def _add_choice_image(self) -> None:
+        if not self._current_q:
+            return
+        index = max(0, min(4, self.q_choices.textCursor().blockNumber()))
+        self._add_content_image(f"choice:{index}")
+
+    def _remove_content_image(self, scope: str) -> None:
+        if not self._current:
+            return
+        if scope == "passage":
+            owner = self._current.images
+            candidates = list(enumerate(owner))
+        elif self._current_q:
+            owner = self._current_q.images
+            candidates = [
+                (index, asset)
+                for index, asset in enumerate(owner)
+                if (scope == "stem" and asset.anchor in {"stem", "after"})
+                or (scope == "choices" and asset.anchor.startswith("choice:"))
+            ]
+        else:
+            return
+        if not candidates:
+            QMessageBox.information(self, "그림 삭제", "삭제할 그림이 없습니다.")
+            return
+        labels = [
+            f"{asset.anchor} · {asset.alt} · {asset.width}×{asset.height}"
+            for _index, asset in candidates
+        ]
+        selected, ok = QInputDialog.getItem(self, "그림 삭제", "삭제할 그림", labels, 0, False)
+        if not ok:
+            return
+        selected_index = labels.index(selected)
+        del owner[candidates[selected_index][0]]
         self._current.touch()
         self._after_edit()
 
@@ -343,19 +459,25 @@ class EditorView(QWidget):
             QMessageBox.warning(self, "AI 난이도 판별", str(exc))
             return
         snapshot = deepcopy(self._current)
+        original_model = self.state.config.gemini_model
         classifier = DifficultyClassifier(client)
         self._ai_busy = True
         self.ai_btn.setText("AI 분석 중…")
         self._refresh_ai_button()
         self.state.run_async(
-            classifier.classify,
-            snapshot,
+            lambda: (
+                classifier.classify(snapshot),
+                client.model,
+                original_model,
+                client.model != original_model,
+            ),
             on_result=self._apply_ai_analysis,
             on_error=lambda exc: QMessageBox.warning(self, "AI 난이도 판별 실패", str(exc)),
             on_finished=self._finish_ai_analysis,
         )
 
-    def _apply_ai_analysis(self, analyzed: Passage) -> None:
+    def _apply_ai_analysis(self, result) -> None:
+        analyzed, selected_model, original_model, model_changed = result
         target = self.state.library.get_passage(analyzed.id)
         if target is None:
             return
@@ -371,6 +493,16 @@ class EditorView(QWidget):
                 question.difficulty_source = source.difficulty_source
                 question.question_type = source.question_type
         target.touch()
+        if (
+            model_changed
+            and selected_model
+            and self.state.config.gemini_model == original_model
+        ):
+            self.state.config.gemini_model = selected_model
+            try:
+                self.state.save_config()
+            except OSError as exc:
+                QMessageBox.warning(self, "모델 저장 실패", str(exc))
         self.state.mark_dirty()
         try:
             self.state.save_library()
@@ -452,8 +584,8 @@ class EditorView(QWidget):
         self.q_number.setText(q.number if q else "")
         self.q_type.setCurrentText(q.question_type if q else "")
         self.q_diff.set_value(q.difficulty if q else None)
-        self.q_stem.setPlainText(q.stem if q else "")
-        self.q_choices.setPlainText("\n".join(q.choices) if q else "")
+        self.q_stem.set_content(q.stem, q.stem_html) if q else self.q_stem.set_content("", "")
+        self.q_choices.set_blocks(q.choices, q.choices_html) if q else self.q_choices.set_blocks([], [])
         self.q_answer.setText(q.answer if q else "")
         self.q_explanation.setPlainText(q.explanation if q else "")
         self._loading = was_loading
@@ -464,8 +596,14 @@ class EditorView(QWidget):
         q = self._current_q
         q.number = self.q_number.text().strip()
         q.question_type = self.q_type.currentText().strip()
-        q.stem = self.q_stem.toPlainText()
-        q.choices = [c.strip() for c in self.q_choices.toPlainText().splitlines() if c.strip()]
+        q.stem = self.q_stem.plain_projection()
+        q.stem_html = self.q_stem.safe_html()
+        choice_blocks = self.q_choices.block_contents(include_empty=True)[:5]
+        while len(choice_blocks) < len(q.choices):
+            choice_blocks.append(("", ""))
+        new_choices = [plain for plain, _rich in choice_blocks]
+        q.choices = new_choices
+        q.choices_html = [rich for _plain, rich in choice_blocks]
         q.answer = self.q_answer.text().strip()
         q.explanation = self.q_explanation.toPlainText()
         self._after_question_edit()
@@ -517,6 +655,6 @@ class EditorView(QWidget):
     # ========================================================= 미리보기
     def _update_preview(self) -> None:
         if self._current:
-            self.preview.setHtml(passage_preview_html(self._current))
+            self.preview.setHtml(passage_preview_html(self._current, self.state.asset_store))
         else:
             self.preview.setHtml("<p style='color:#90a4ae;'>지문을 선택하거나 '+ 새 지문'으로 추가하세요.</p>")

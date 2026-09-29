@@ -5,15 +5,21 @@
 """
 from __future__ import annotations
 
+from copy import deepcopy
+from pathlib import Path
+import re
 from typing import Optional
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, QUrl, pyqtSignal
+from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QComboBox, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
-    QListWidget, QListWidgetItem, QMessageBox, QPushButton, QSplitter, QVBoxLayout, QWidget,
+    QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
+    QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+    QListWidgetItem, QMessageBox, QPushButton, QSplitter, QVBoxLayout, QWidget,
 )
 
 from ..models import ExamSet, Passage
+from ..services.pdf_exporter import ExportOptions, ExportResult, PdfExportError, PdfExporter
 from .editor_view import color_icon
 from .state import AppState
 from .styles import difficulty_color
@@ -26,6 +32,92 @@ def _passage_label(p: Passage) -> str:
     lv = f"Lv.{p.difficulty}" if p.difficulty else "미분류"
     ptype = f" · {p.passage_type}" if p.passage_type else ""
     return f"[{lv}] {p.display_title}{ptype}  ({len(p.questions)}문항)"
+
+
+class ExportOptionsDialog(QDialog):
+    def __init__(self, title: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("PDF 출판 설정")
+        self.setMinimumWidth(480)
+        layout = QVBoxLayout(self)
+        info = QLabel(
+            "각 지문은 새 페이지에서 시작합니다. 지문과 문제가 한 페이지보다 길면 "
+            "읽기 쉬운 크기를 유지하며 다음 페이지로 이어집니다."
+        )
+        info.setWordWrap(True)
+        info.setObjectName("Muted")
+        layout.addWidget(info)
+        form = QFormLayout()
+        self.title_edit = QLineEdit(title)
+        form.addRow("문서 제목", self.title_edit)
+        self.font_size = QDoubleSpinBox()
+        self.font_size.setRange(8.0, 18.0)
+        self.font_size.setSingleStep(0.5)
+        self.font_size.setValue(10.5)
+        self.font_size.setSuffix(" pt")
+        form.addRow("본문 글자 크기", self.font_size)
+        self.include_answers = QCheckBox("마지막에 정답지 추가")
+        self.include_explanations = QCheckBox("해설도 함께 출력")
+        self.include_explanations.setEnabled(False)
+        self.include_answers.toggled.connect(self.include_explanations.setEnabled)
+        form.addRow("정답", self.include_answers)
+        form.addRow("", self.include_explanations)
+        font_row = QHBoxLayout()
+        self.font_path = QLineEdit()
+        self.font_path.setPlaceholderText("비워 두면 Windows 맑은 고딕을 자동 사용합니다")
+        font_btn = QPushButton("찾아보기…")
+        font_btn.clicked.connect(self._browse_font)
+        font_row.addWidget(self.font_path, 1)
+        font_row.addWidget(font_btn)
+        form.addRow("한글 TTF 글꼴", font_row)
+        bold_font_row = QHBoxLayout()
+        self.bold_font_path = QLineEdit()
+        self.bold_font_path.setPlaceholderText("비워 두면 맑은 고딕 Bold를 자동 탐색합니다")
+        bold_font_btn = QPushButton("찾아보기…")
+        bold_font_btn.clicked.connect(self._browse_bold_font)
+        bold_font_row.addWidget(self.bold_font_path, 1)
+        bold_font_row.addWidget(bold_font_btn)
+        form.addRow("굵은 TTF 글꼴", bold_font_row)
+        layout.addLayout(form)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("PDF 만들기")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _browse_font(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "한글 글꼴 선택",
+            "",
+            "TrueType 글꼴 (*.ttf *.ttc);;모든 파일 (*)",
+        )
+        if path:
+            self.font_path.setText(path)
+
+    def _browse_bold_font(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "굵은 한글 글꼴 선택",
+            "",
+            "TrueType 글꼴 (*.ttf *.ttc);;모든 파일 (*)",
+        )
+        if path:
+            self.bold_font_path.setText(path)
+
+    def options(self) -> ExportOptions:
+        return ExportOptions(
+            title=self.title_edit.text().strip(),
+            include_answers=self.include_answers.isChecked(),
+            include_explanations=(
+                self.include_answers.isChecked() and self.include_explanations.isChecked()
+            ),
+            font_path=self.font_path.text().strip(),
+            bold_font_path=self.bold_font_path.text().strip(),
+            font_size=self.font_size.value(),
+        )
 
 
 class ExamWorkspaceList(QListWidget):
@@ -79,6 +171,7 @@ class TestCreatorView(QWidget):
         super().__init__(parent)
         self.state = state
         self._exam: Optional[ExamSet] = None
+        self._export_busy = False
         self._build_ui()
         state.library_changed.connect(self.refresh_all)
         self.refresh_all()
@@ -172,7 +265,7 @@ class TestCreatorView(QWidget):
         self.workspace.order_changed.connect(self._sync_order_from_list)
         lay.addWidget(self.workspace, 1)
 
-        hint = QLabel("※ 드래그해서 순서를 바꾸거나, 탐색기에서 끌어다 놓을 수 있습니다. 1지문 = 1페이지로 출판됩니다.")
+        hint = QLabel("※ 각 지문은 새 페이지에서 시작하며, 긴 지문·문제는 잘리지 않고 다음 페이지로 이어집니다.")
         hint.setObjectName("Muted")
         hint.setWordWrap(True)
         lay.addWidget(hint)
@@ -316,7 +409,7 @@ class TestCreatorView(QWidget):
         levels = [p.difficulty for p in passages if p.difficulty]
         avg = f"{sum(levels) / len(levels):.1f}" if levels else "-"
         self.summary_label.setText(f"지문 {len(passages)} · 문제 {n_q} · 평균 난이도 {avg}")
-        self.export_btn.setEnabled(bool(passages))
+        self.export_btn.setEnabled(bool(passages) and not self._export_busy)
 
     def _add_selected(self) -> None:
         ids = [it.data(ROLE_ID) for it in self.browser_list.selectedItems()]
@@ -369,4 +462,66 @@ class TestCreatorView(QWidget):
             self._refresh_workspace(select_rows=[t])
 
     def _export_pdf(self) -> None:
-        QMessageBox.information(self, "PDF 내보내기", "1지문-1페이지 PDF 출판 엔진은 Step 5 에서 구현됩니다.")
+        if not self._exam or self._export_busy:
+            return
+        passages = [
+            self.state.library.get_passage(passage_id) for passage_id in self._exam.passage_ids
+        ]
+        passages = [deepcopy(passage) for passage in passages if passage is not None]
+        if not passages:
+            QMessageBox.warning(self, "PDF 내보내기", "시험지에 지문을 먼저 담아 주세요.")
+            return
+
+        dialog = ExportOptionsDialog(self._exam.title, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        options = dialog.options()
+        safe_name = re.sub(r'[<>:"/\\|?*]+', "_", options.title or self._exam.title or "시험지")
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "시험지 PDF 저장",
+            f"{safe_name}.pdf",
+            "PDF 파일 (*.pdf)",
+        )
+        if not path:
+            return
+
+        exporter = PdfExporter(options, asset_store=self.state.asset_store)
+        self._set_export_busy(True)
+        self.state.run_async(
+            exporter.export,
+            passages,
+            Path(path),
+            on_result=self._on_export_success,
+            on_error=self._on_export_error,
+            on_finished=lambda: self._set_export_busy(False),
+        )
+
+    def _set_export_busy(self, busy: bool) -> None:
+        self._export_busy = busy
+        self.export_btn.setText("PDF 생성 중…" if busy else "PDF 내보내기")
+        self.export_btn.setEnabled(not busy and bool(self._exam and self._exam.passage_ids))
+
+    def _on_export_success(self, result: ExportResult) -> None:
+        self.state.status(f"PDF 저장 완료: {result.path}", 8000)
+        box = QMessageBox(self)
+        box.setWindowTitle("PDF 출판 완료")
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setText(
+            f"지문 {result.passage_count}개·문제 {result.question_count}개를 "
+            f"{result.page_count}페이지 PDF로 만들었습니다."
+        )
+        box.setInformativeText(f"저장 위치:\n{result.path}\n\n지금 PDF를 열까요?")
+        if result.warnings:
+            box.setDetailedText("\n".join(f"• {warning}" for warning in result.warnings))
+        box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if box.exec() == QMessageBox.StandardButton.Yes:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(result.path)))
+
+    def _on_export_error(self, exc: Exception) -> None:
+        message = str(exc) if isinstance(exc, PdfExportError) else f"예상하지 못한 오류: {exc}"
+        QMessageBox.critical(
+            self,
+            "PDF 내보내기 실패",
+            f"{message}\n\n글꼴 또는 그림 파일을 확인한 뒤 다시 시도해 주세요.",
+        )

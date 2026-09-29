@@ -175,6 +175,10 @@ class SettingsDialog(QDialog):
         )
 
     def _on_test_result(self, result: ConnectionTestResult) -> None:
+        if result.ok and result.model:
+            if self.model_combo.findText(result.model) < 0:
+                self.model_combo.addItem(result.model)
+            self.model_combo.setCurrentText(result.model)
         self._show_result(result.ok, result.message)
 
     def _show_result(self, ok: bool, message: str) -> None:

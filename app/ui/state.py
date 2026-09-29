@@ -6,6 +6,7 @@ from typing import Any, Callable, Optional
 
 from PyQt6.QtCore import QObject, QThreadPool, pyqtSignal
 
+from ..assets import AssetStore
 from ..config import AppConfig, ConfigManager
 from ..models import Library
 from ..services.gemini_client import GeminiClient
@@ -25,6 +26,7 @@ class AppState(QObject):
         super().__init__()
         self.config_manager = config_manager
         self.repository = repository
+        self.asset_store = AssetStore(config_manager.data_dir)
         self.library: Library = repository.load()
         self.thread_pool = QThreadPool.globalInstance()
         self._dirty = False

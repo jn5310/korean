@@ -29,6 +29,7 @@ _CLASSIFICATION_SCHEMA = {
     "properties": {
         "passages": {
             "type": "array",
+            "minItems": 1,
             "items": {
                 "type": "object",
                 "properties": {
@@ -122,6 +123,7 @@ class DifficultyClassifier:
                 schema=_CLASSIFICATION_SCHEMA,
                 system_instruction=_SYSTEM_INSTRUCTION,
                 temperature=0.1,
+                validator=lambda value, batch=batch: self._validate_candidate(batch, value),
             )
             batch_result = self._apply_response(batch, data)
             warnings.extend(batch_result.warnings)
@@ -139,6 +141,23 @@ class DifficultyClassifier:
         )
 
     # ------------------------------------------------------------------
+    @staticmethod
+    def _validate_candidate(passages: list[Passage], data) -> None:
+        items = data.get("passages", []) if isinstance(data, dict) else []
+        returned = {str(item.get("id", "")): item for item in items if isinstance(item, dict)}
+        for passage in passages:
+            item = returned.get(passage.id)
+            if item is None:
+                raise GeminiError(f"모델 응답 형식이 입력 지문 ID를 누락했습니다: {passage.id}")
+            question_ids = {
+                str(question.get("id", ""))
+                for question in item.get("questions", [])
+                if isinstance(question, dict)
+            }
+            missing = [question.id for question in passage.questions if question.id not in question_ids]
+            if missing:
+                raise GeminiError("모델 응답 형식이 입력 문항 ID를 누락했습니다: " + ", ".join(missing))
+
     def _make_batches(self, passages: list[Passage]) -> list[list[Passage]]:
         batches: list[list[Passage]] = []
         current: list[Passage] = []
@@ -261,7 +280,7 @@ def _difficulty(value) -> Optional[int]:
         return None
     try:
         level = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return level if 1 <= level <= 5 else None
 

@@ -14,6 +14,7 @@ from .difficulty import DifficultyClassifier
 from .document_analyzer import GeminiDocumentAnalyzer
 from .gemini_client import GeminiError
 from .pdf_parser import ParseResult, PdfAnalysisError, PdfParser
+from .rich_content import rich_html_to_plain
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +34,9 @@ class AnalysisBatchResult:
     results: list[ParseResult] = field(default_factory=list)
     failures: list[FileAnalysisFailure] = field(default_factory=list)
     general_warnings: list[str] = field(default_factory=list)
+    selected_model: str = ""
+    original_model: str = ""
+    model_changed: bool = False
 
     @property
     def passages(self) -> list[Passage]:
@@ -170,6 +174,10 @@ class AnalysisPipeline:
         elif result.passages:
             result.warnings.append("Gemini API Key가 없어 난이도·유형 자동 판별을 건너뛰었습니다.")
 
+        if result.passages and result.pages:
+            result.warnings.extend(
+                self.parser.project_rich_content(result.passages, result.pages, result.source_file)
+            )
         result.warnings = list(dict.fromkeys(result.warnings))
         if not result.passages and local_error:
             raise local_error
@@ -217,6 +225,108 @@ def _normalized_passage_content(passage: Passage) -> str:
         for question in passage.questions
     )
     return re.sub(r"\W+", "", text, flags=re.UNICODE).lower()
+
+
+def merge_rich_content(existing: Passage, incoming: Passage) -> bool:
+    """동등 레코드에서 평문과 정확히 대응하는 서식·그림만 비파괴적으로 보강."""
+    changed = False
+    passage_matches = _same_plain(existing.text, incoming.text)
+    if (
+        passage_matches
+        and not existing.text_html
+        and incoming.text_html
+        and _html_matches(existing.text, incoming.text_html)
+    ):
+        existing.text_html = incoming.text_html
+        changed = True
+    if passage_matches:
+        changed |= _merge_assets(existing.images, incoming.images)
+    if not existing.source_digest and incoming.source_digest:
+        existing.source_digest = incoming.source_digest
+        changed = True
+
+    existing_counts = _number_counts(existing.questions)
+    incoming_counts = _number_counts(incoming.questions)
+    for index, question in enumerate(existing.questions):
+        source = None
+        if (
+            question.number
+            and existing_counts.get(question.number) == 1
+            and incoming_counts.get(question.number) == 1
+        ):
+            source = next(item for item in incoming.questions if item.number == question.number)
+        elif index < len(incoming.questions):
+            candidate = incoming.questions[index]
+            if _question_plain_matches(question, candidate):
+                source = candidate
+        if source is None or not _question_plain_matches(question, source):
+            continue
+        if (
+            not question.stem_html
+            and source.stem_html
+            and _html_matches(question.stem, source.stem_html)
+        ):
+            question.stem_html = source.stem_html
+            changed = True
+        if len(question.choices_html) < len(question.choices):
+            question.choices_html.extend([""] * (len(question.choices) - len(question.choices_html)))
+        for choice_index in range(min(len(question.choices_html), len(source.choices_html))):
+            incoming_html = source.choices_html[choice_index]
+            if (
+                not question.choices_html[choice_index]
+                and incoming_html
+                and _html_matches(question.choices[choice_index], incoming_html)
+            ):
+                question.choices_html[choice_index] = incoming_html
+                changed = True
+        changed |= _merge_assets(question.images, source.images)
+        if not question.source_pages and source.source_pages:
+            question.source_pages = list(source.source_pages)
+            changed = True
+    if changed:
+        existing.touch()
+    return changed
+
+
+def _number_counts(questions) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for question in questions:
+        if question.number:
+            counts[question.number] = counts.get(question.number, 0) + 1
+    return counts
+
+
+def _same_plain(left: str, right: str) -> bool:
+    def canonical(value: str) -> str:
+        return value.replace("\r\n", "\n").replace("\r", "\n")
+    return canonical(left) == canonical(right)
+
+
+def _html_matches(plain: str, rich_html: str) -> bool:
+    return _same_plain(plain, rich_html_to_plain(rich_html))
+
+
+def _question_plain_matches(left, right) -> bool:
+    return (
+        _same_plain(left.stem, right.stem)
+        and len(left.choices) == len(right.choices)
+        and all(_same_plain(a, b) for a, b in zip(left.choices, right.choices, strict=True))
+    )
+
+
+def _merge_assets(existing, incoming) -> bool:
+    keys = {
+        (asset.relative_path, asset.source_page, tuple(asset.bbox), asset.anchor, asset.offset)
+        for asset in existing
+    }
+    changed = False
+    for asset in incoming:
+        key = (asset.relative_path, asset.source_page, tuple(asset.bbox), asset.anchor, asset.offset)
+        if key not in keys:
+            existing.append(asset)
+            keys.add(key)
+            changed = True
+    return changed
 
 
 def _source_file_digest(source_file: str) -> str:

@@ -20,11 +20,12 @@ logger = logging.getLogger(__name__)
 
 # Gemini 모델 기본값. 모델 ID 는 수시로 바뀌므로 설정 화면에서
 # 직접 입력하거나 "모델 목록 불러오기"로 갱신할 수 있게 한다.
-DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+DEFAULT_GEMINI_MODEL = "gemini-flash-latest"
 SUGGESTED_GEMINI_MODELS = [
+    "gemini-flash-latest",
+    "gemini-flash-lite-latest",
+    "gemini-pro-latest",
     "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-2.5-pro",
 ]
 
 # 난이도 체계 (1 = 최하, 5 = 최상)
@@ -54,7 +55,7 @@ ENV_DATA_DIR = "STUDIO_DATA_DIR"
 def _bounded_int(value, default: int, minimum: int, maximum: int) -> int:
     try:
         number = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         number = default
     return max(minimum, min(maximum, number))
 

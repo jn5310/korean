@@ -21,7 +21,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
-from ..models import Passage
+from ..assets import AssetStore
+from ..models import MediaAsset, Passage
+from .rich_content import PdfRichExtractor, RichContentProjector, RichRun
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +48,9 @@ class PageText:
     text: str
     method: str               # "text" | "ocr" | "empty"
     quality: float = 0.0      # 0.0 ~ 1.0 추출 품질 추정치
+    rich_html: str = ""
+    runs: list[RichRun] = field(default_factory=list)
+    images: list[MediaAsset] = field(default_factory=list)
 
 
 @dataclass
@@ -83,6 +88,7 @@ class PdfParser:
         min_text_chars: int = 35,
         text_quality_threshold: float = 0.48,
         ocr_timeout_sec: int = 90,
+        asset_store: Optional[AssetStore] = None,
     ) -> None:
         self.tesseract_cmd = tesseract_cmd.strip()
         self.ocr_languages = ocr_languages.strip() or "kor+eng"
@@ -90,6 +96,9 @@ class PdfParser:
         self.min_text_chars = max(10, int(min_text_chars))
         self.text_quality_threshold = max(0.1, min(0.95, float(text_quality_threshold)))
         self.ocr_timeout_sec = max(10, int(ocr_timeout_sec))
+        self.asset_store = asset_store
+        self._rich_extractor = PdfRichExtractor(asset_store)
+        self._rich_projector = RichContentProjector()
 
     # ------------------------------------------------------------------
     def parse(self, pdf_path: Path, progress: Optional[ProgressCallback] = None) -> ParseResult:
@@ -102,6 +111,7 @@ class PdfParser:
 
         structured = parse_page_structure(pages, source_file=str(path))
         warnings.extend(structured.warnings)
+        warnings.extend(self.project_rich_content(structured.passages, pages, str(path)))
         if not pages or all(not page.text.strip() for page in pages):
             warnings.append(
                 "문서에서 읽을 수 있는 텍스트를 찾지 못했습니다. "
@@ -114,6 +124,14 @@ class PdfParser:
             warnings=_deduplicate(warnings),
             confidence=structured.confidence,
         )
+
+    def project_rich_content(
+        self,
+        passages: list[Passage],
+        pages: list[PageText],
+        source_file: str,
+    ) -> list[str]:
+        return self._rich_projector.project(passages, pages, source_file)
 
     def extract_pages(
         self,
@@ -143,6 +161,7 @@ class PdfParser:
         cleaned, removed = remove_repeated_margins(pages)
         if removed:
             warning_list.append(f"반복 머리말/꼬리말 {removed}개를 자동 제거했습니다.")
+        self._rich_extractor.enrich(path, cleaned, warning_list)
         return cleaned
 
     def _extract_with_pdfplumber(

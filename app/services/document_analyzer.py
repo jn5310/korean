@@ -23,6 +23,7 @@ _AI_DOCUMENT_SCHEMA = {
     "properties": {
         "passages": {
             "type": "array",
+            "minItems": 1,
             "items": {
                 "type": "object",
                 "properties": {
@@ -135,6 +136,7 @@ class GeminiDocumentAnalyzer:
                 schema=_AI_DOCUMENT_SCHEMA,
                 system_instruction=_SYSTEM,
                 temperature=0.1,
+                validator=self._validate_candidate,
             )
             parsed = self._parse_response(
                 data,
@@ -165,6 +167,7 @@ class GeminiDocumentAnalyzer:
             schema=_AI_DOCUMENT_SCHEMA,
             system_instruction=_SYSTEM,
             temperature=0.1,
+            validator=self._validate_candidate,
         )
         return self._parse_response(
             data,
@@ -173,6 +176,25 @@ class GeminiDocumentAnalyzer:
             fallback_pages=[],
             source_text="",
         )
+
+    @staticmethod
+    def _validate_candidate(data) -> None:
+        passages = data.get("passages", []) if isinstance(data, dict) else []
+        valid_questions = 0
+        for passage in passages:
+            if not isinstance(passage, dict) or not str(passage.get("text", "")).strip():
+                continue
+            for question in passage.get("questions", []):
+                choices = question.get("choices", []) if isinstance(question, dict) else []
+                if (
+                    str(question.get("stem", "")).strip()
+                    and isinstance(choices, list)
+                    and len(choices) == 5
+                    and all(isinstance(choice, str) and choice.strip() for choice in choices)
+                ):
+                    valid_questions += 1
+        if valid_questions == 0:
+            raise GeminiError("모델 응답 형식에 완전한 오지선다 문항이 없습니다.")
 
     def reconcile(
         self,
@@ -376,7 +398,7 @@ def _valid_page_numbers(value, valid_pages: Optional[set[int]]) -> list[int]:
             continue
         try:
             page = int(item)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
         if page > 0 and (valid_pages is None or page in valid_pages) and page not in result:
             result.append(page)

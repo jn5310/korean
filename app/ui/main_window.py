@@ -72,9 +72,9 @@ class MainWindow(QMainWindow):
         save.triggered.connect(self.save_library)
         file_menu.addAction(save)
         file_menu.addSeparator()
-        exp = QAction("라이브러리 내보내기 (JSON)…", self)
+        exp = QAction("라이브러리 백업 내보내기 (.koreanlib)…", self)
         exp.triggered.connect(self._export_library)
-        imp = QAction("라이브러리 가져오기 (JSON)…", self)
+        imp = QAction("라이브러리 백업 가져오기…", self)
         imp.triggered.connect(self._import_library)
         file_menu.addAction(exp)
         file_menu.addAction(imp)
@@ -131,23 +131,41 @@ class MainWindow(QMainWindow):
             return False
 
     def _export_library(self) -> None:
-        path, _ = QFileDialog.getSaveFileName(self, "라이브러리 내보내기", "library.json", "JSON (*.json)")
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "라이브러리 백업 내보내기",
+            "library.koreanlib",
+            "지문 스튜디오 백업 (*.koreanlib)",
+        )
         if not path:
             return
         try:
-            self.state.repository.export_to(self.state.library, Path(path))
-            self.state.status(f"내보내기 완료: {path}")
+            destination, warnings = self.state.repository.export_bundle(
+                self.state.library, Path(path)
+            )
+            self.state.status(f"백업 완료: {destination}")
+            if warnings:
+                QMessageBox.warning(self, "백업 완료 (일부 그림 누락)", "\n".join(warnings))
         except OSError as exc:
             QMessageBox.critical(self, "내보내기 실패", str(exc))
 
     def _import_library(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "라이브러리 가져오기", "", "JSON (*.json)")
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "라이브러리 백업 가져오기",
+            "",
+            "지문 스튜디오 백업 (*.koreanlib);;구버전 JSON (*.json)",
+        )
         if not path:
             return
+        warnings = []
         try:
-            imported = self.state.repository.import_from(Path(path))
-        except (OSError, ValueError, TypeError, KeyError) as exc:
-            QMessageBox.critical(self, "가져오기 실패", f"올바른 라이브러리 파일이 아닙니다.\n{exc}")
+            if Path(path).suffix.lower() == ".koreanlib":
+                imported, warnings = self.state.repository.import_bundle(Path(path))
+            else:
+                imported = self.state.repository.import_from(Path(path))
+        except (OSError, ValueError, TypeError, KeyError, OverflowError) as exc:
+            QMessageBox.critical(self, "가져오기 실패", f"올바른 라이브러리 백업이 아닙니다.\n{exc}")
             return
         lib = self.state.library
         existing = {p.id for p in lib.passages}
@@ -157,6 +175,8 @@ class MainWindow(QMainWindow):
         lib.exam_sets.extend(e for e in imported.exam_sets if e.id not in existing_exams)
         self.state.mark_dirty()
         self.state.status(f"지문 {len(new_passages)}개를 가져왔습니다.")
+        if warnings:
+            QMessageBox.warning(self, "가져오기 완료 (일부 그림 누락)", "\n".join(warnings))
 
     def _about(self) -> None:
         QMessageBox.about(
