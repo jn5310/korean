@@ -15,7 +15,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Optional
 
-from ..assets import AssetStore
+from ..assets import AssetStore, asset_display_size
 from ..models import MediaAsset, Passage, Question
 
 
@@ -184,10 +184,20 @@ class PdfExporter:
                 continue
             try:
                 image = rl["Image"](str(path))
-                width, height = image.imageWidth, image.imageHeight
-                scale = min(doc.width / max(1, width), doc.height * 0.52 / max(1, height), 1.0)
-                image.drawWidth = width * scale
-                image.drawHeight = height * scale
+                # 원본 PDF에서 차지하던 실제 크기에 맞춘다(본문 글자 크기와 비슷한 비율).
+                width, height = asset_display_size(
+                    asset,
+                    image.imageWidth,
+                    image.imageHeight,
+                    points_scale=1.15,
+                    pixel_scale=0.75,
+                    max_width=doc.width,
+                    max_height=doc.height * 0.8,
+                )
+                if width <= 0 or height <= 0:
+                    raise ValueError("그림 크기를 알 수 없습니다.")
+                image.drawWidth = width
+                image.drawHeight = height
                 image.hAlign = "CENTER"
                 output.extend([rl["Spacer"](1, 5), image, rl["Spacer"](1, 5)])
             except Exception as exc:  # noqa: BLE001 - 손상 그림 하나가 전체 PDF를 막지 않음
@@ -224,7 +234,7 @@ class _MarkupConverter(HTMLParser):
         elif tag == "u":
             opened = ["u"]
         elif tag == "span":
-            style = dict(attrs).get("style", "")
+            style = dict(attrs).get("style") or ""
             declarations = _style_declarations(style)
             if declarations.get("font-weight") in {"600", "700", "bold"}:
                 opened.append("b")

@@ -78,13 +78,47 @@ class _ChoiceToken:
 
 
 def parse_page_structure(pages: list["PageText"], source_file: str = "") -> StructureResult:
+    per_page: list[list[SourceLine]] = [
+        [SourceLine(line.rstrip(), page.page_number) for line in (page.text.splitlines() if page.text else [])]
+        for page in pages
+    ]
+    # 레이아웃 엔진이 '다음 페이지로 이어지는 문단'이라고 판단한 경우 두 줄을 하나로 합친다.
+    for index in range(len(pages) - 1):
+        if not getattr(pages[index], "join_next", False):
+            continue
+        current = per_page[index]
+        following = per_page[index + 1]
+        last = next((i for i in range(len(current) - 1, -1, -1) if current[i].text.strip()), None)
+        first = next((i for i, line in enumerate(following) if line.text.strip()), None)
+        if last is None or first is None:
+            continue
+        if _is_placeholder_line(current[last].text) or _is_placeholder_line(following[first].text):
+            continue
+        joiner = " " if getattr(pages[index], "join_space", False) else ""
+        merged = current[last].text.rstrip() + joiner + following[first].text.lstrip()
+        current[last] = SourceLine(merged, current[last].page_number)
+        del following[first]
+
     lines: list[SourceLine] = []
-    for page in pages:
-        page_lines = page.text.splitlines() if page.text else []
-        lines.extend(SourceLine(line.rstrip(), page.page_number) for line in page_lines)
+    for index, page in enumerate(pages):
+        lines.extend(per_page[index])
+        if getattr(page, "join_next", False) and index + 1 < len(pages):
+            continue
         # 페이지 경계를 빈 줄 두 개로 보존하면 지문/선택지 문단 분리에 도움이 된다.
         lines.extend((SourceLine("", page.page_number), SourceLine("", page.page_number)))
     return parse_source_lines(lines, source_file=source_file)
+
+
+_PLACEHOLDER_RE = re.compile("\ue000[A-Za-z0-9_-]{1,40}\ue001")
+
+
+def _is_placeholder_line(text: str) -> bool:
+    return bool(text.strip()) and not _PLACEHOLDER_RE.sub("", text).strip()
+
+
+def _content_length(text: str) -> int:
+    """자리표시자(그림 위치)는 본문 길이로 세지 않는다."""
+    return len(re.sub(r"\s+", "", _PLACEHOLDER_RE.sub("", text)))
 
 
 def parse_text_structure(text: str, source_file: str = "", page_number: int = 1) -> StructureResult:
@@ -232,15 +266,21 @@ def _implicit_section_boundaries(lines: list[SourceLine]) -> list[int]:
             continue
 
         # 빈 줄 뒤에 충분한 본문이 있고 그 다음 문항이 시작되면 가장 강한 경계 신호다.
+        # 새 지문이 그림으로 시작하면(자리표시자 줄) 그림부터 새 지문에 포함한다.
         saw_blank = False
+        figure_start: Optional[int] = None
         for index in range(fifth_line + 1, end):
             if not lines[index].text.strip():
                 saw_blank = True
                 continue
             if saw_blank:
+                if _is_placeholder_line(lines[index].text):
+                    if figure_start is None:
+                        figure_start = index
+                    continue
                 trailing = _join_lines(_trim_blank_lines(lines[index:end])).strip()
-                if len(re.sub(r"\s+", "", trailing)) >= 5:
-                    boundaries.append(index)
+                if _content_length(trailing) >= 5:
+                    boundaries.append(figure_start if figure_start is not None else index)
                 break
 
         if boundaries and boundaries[-1] > fifth_line:
@@ -248,12 +288,17 @@ def _implicit_section_boundaries(lines: list[SourceLine]) -> list[int]:
 
         # 빈 줄이 사라진 OCR 결과에서는 새 페이지의 긴 본문만 보수적으로 경계로 본다.
         fifth_page = lines[fifth_line].page_number
+        figure_start = None
         for index in range(fifth_line + 1, end):
             if lines[index].page_number == fifth_page or not lines[index].text.strip():
                 continue
+            if _is_placeholder_line(lines[index].text):
+                if figure_start is None:
+                    figure_start = index
+                continue
             trailing = _join_lines(_trim_blank_lines(lines[index:end])).strip()
-            if len(re.sub(r"\s+", "", trailing)) >= 5:
-                boundaries.append(index)
+            if _content_length(trailing) >= 5:
+                boundaries.append(figure_start if figure_start is not None else index)
             break
     return sorted(set(boundaries))
 

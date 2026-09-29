@@ -66,6 +66,9 @@ def _bbox(value) -> list[float]:
     return result if result[2] >= result[0] and result[3] >= result[1] else []
 
 
+MEDIA_KINDS = {"", "bogi", "table", "figure", "image", "page"}
+
+
 @dataclass
 class MediaAsset:
     """앱 자산 폴더에 보관되는 래스터 그림과 원본 위치."""
@@ -80,6 +83,8 @@ class MediaAsset:
     anchor: str = "after"       # passage | stem | choice:0..4 | after
     offset: int = 0              # 대응 평문 내 근사 문자 위치
     alt: str = "문제 그림"
+    kind: str = ""               # bogi | table | figure | image | page | ""(직접 추가)
+    text: str = ""               # 그림 안 글자(검색·AI 참고용, 화면에는 그림만 표시)
 
     def __post_init__(self) -> None:
         self.relative_path = _safe_relative_path(self.relative_path)
@@ -91,6 +96,15 @@ class MediaAsset:
         self.anchor = self.anchor if isinstance(self.anchor, str) and self.anchor in {"passage", "stem", "after", "choice:0", "choice:1", "choice:2", "choice:3", "choice:4"} else "after"
         self.offset = _nonnegative_int(self.offset, 10_000_000)
         self.alt = str(self.alt or "문제 그림")[:200]
+        self.kind = self.kind if isinstance(self.kind, str) and self.kind in MEDIA_KINDS else ""
+        self.text = str(self.text or "")[:20_000]
+
+    @property
+    def point_width(self) -> float:
+        """PDF 원본에서 차지하던 폭(pt). 알 수 없으면 0."""
+        if len(self.bbox) == 4 and self.bbox[2] > self.bbox[0]:
+            return float(self.bbox[2] - self.bbox[0])
+        return 0.0
 
     def to_dict(self) -> dict:
         return {
@@ -104,6 +118,8 @@ class MediaAsset:
             "anchor": self.anchor,
             "offset": self.offset,
             "alt": self.alt,
+            "kind": self.kind,
+            "text": self.text,
         }
 
     @classmethod
@@ -121,6 +137,8 @@ class MediaAsset:
             anchor=data.get("anchor", "after"),
             offset=data.get("offset", 0),
             alt=data.get("alt", "문제 그림"),
+            kind=data.get("kind", ""),
+            text=data.get("text", ""),
         )
 
 
@@ -209,9 +227,14 @@ class Passage:
     text_html: str = ""
     images: list[MediaAsset] = field(default_factory=list)
     source_digest: str = ""
+    # v3: 편집 화면에서 직접 고친 적이 있는지. None = 알 수 없음(이전 버전 기록).
+    # 재분석 교체 시 사용자가 고쳤을 수 있는 지문을 지우지 않는 판단에 쓴다.
+    edited: Optional[bool] = False
 
     def __post_init__(self) -> None:
         self.difficulty = clamp_difficulty(self.difficulty)
+        if self.edited is not None:
+            self.edited = bool(self.edited) if isinstance(self.edited, (bool, int)) else None
         self.text_html = self.text_html if isinstance(self.text_html, str) else ""
         self.images = [asset if isinstance(asset, MediaAsset) else MediaAsset.from_dict(asset) for asset in self.images] if isinstance(self.images, list) else []
         self.source_digest = str(self.source_digest or "")[:128]
@@ -244,6 +267,7 @@ class Passage:
             "text_html": self.text_html,
             "images": [asset.to_dict() for asset in self.images if asset.relative_path],
             "source_digest": self.source_digest,
+            "edited": self.edited,
         }
 
     @classmethod
@@ -267,6 +291,7 @@ class Passage:
             text_html=data.get("text_html", ""),
             images=data.get("images", []),
             source_digest=data.get("source_digest", ""),
+            edited=data.get("edited"),
         )
 
 
@@ -298,7 +323,7 @@ class ExamSet:
 class Library:
     """저장되는 전체 데이터 (지문 라이브러리 + 시험지 목록)."""
 
-    SCHEMA_VERSION = 2
+    SCHEMA_VERSION = 3
 
     passages: list[Passage] = field(default_factory=list)
     exam_sets: list[ExamSet] = field(default_factory=list)

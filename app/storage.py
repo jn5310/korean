@@ -120,6 +120,8 @@ class LibraryRepository:
                             anchor=asset.anchor,
                             offset=asset.offset,
                             alt=asset.alt,
+                            kind=asset.kind,
+                            text=asset.text,
                         )
                     except AssetError as exc:
                         warnings.append(f"그림을 가져오지 못했습니다({asset.alt}): {exc}")

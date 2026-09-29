@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 from ..models import Passage, Question
 from .gemini_client import GeminiClient, GeminiError
+from .pdf_text_layout import placeholders_to_tokens
+from .rich_content import strip_figure_tokens
 
 if TYPE_CHECKING:
     from .pdf_parser import PageText
@@ -80,6 +82,7 @@ _PROMPT = """첨부하거나 아래에 제공한 시험 문서를 분석해 JSON
 5. 문항 번호와 source_pages는 원문 기준으로 기록한다.
 6. 정답과 해설은 추정하지 말고 응답에도 포함하지 않는다.
 7. 난이도 기준: 1 직접 사실 확인, 2 쉬운 정보 연결, 3 보통 2단계 추론, 4 추상·복합 추론, 5 고난도 종합·비판 추론.
+8. [[그림:ID]] 토큰은 <보기>·표·그림 이미지가 놓인 자리다. 토큰을 지우거나 바꾸지 말고 원래 위치(지문·발문·선택지)에 그대로 둔다.
 """
 
 
@@ -120,7 +123,8 @@ class GeminiDocumentAnalyzer:
             if progress:
                 progress(chunk_index - 1, len(chunks), f"Gemini 문서 교차 분석 {chunk_index}/{len(chunks)}")
             page_text = "\n\n".join(
-                f'<page number="{page.page_number}">\n{page.text}\n</page>' for page in chunk
+                f'<page number="{page.page_number}">\n{placeholders_to_tokens(page.text)}\n</page>'
+                for page in chunk
             )
             source_text_parts.append(page_text)
             prompt = (
@@ -524,8 +528,8 @@ def _questions_preserved(local: Passage, ai: Passage) -> bool:
 
 
 def _question_preserved(local: Question, ai: Question) -> bool:
-    local_stem = re.sub(r"\s+", "", local.stem).lower()
-    ai_stem = re.sub(r"\s+", "", ai.stem).lower()
+    local_stem = re.sub(r"\s+", "", strip_figure_tokens(local.stem)).lower()
+    ai_stem = re.sub(r"\s+", "", strip_figure_tokens(ai.stem)).lower()
     stem_score = SequenceMatcher(None, local_stem, ai_stem, autojunk=False).ratio()
     if stem_score < 0.60:
         return False
@@ -535,8 +539,8 @@ def _question_preserved(local: Question, ai: Question) -> bool:
         choice_scores = [
             SequenceMatcher(
                 None,
-                re.sub(r"\s+", "", left).lower(),
-                re.sub(r"\s+", "", right).lower(),
+                re.sub(r"\s+", "", strip_figure_tokens(left)).lower(),
+                re.sub(r"\s+", "", strip_figure_tokens(right)).lower(),
                 autojunk=False,
             ).ratio()
             for left, right in zip(local.choices, ai.choices, strict=False)
@@ -547,8 +551,8 @@ def _question_preserved(local: Question, ai: Question) -> bool:
 
 
 def _passage_similarity(left: Passage, right: Passage) -> float:
-    left_text = re.sub(r"\s+", "", left.text).lower()
-    right_text = re.sub(r"\s+", "", right.text).lower()
+    left_text = re.sub(r"\s+", "", strip_figure_tokens(left.text)).lower()
+    right_text = re.sub(r"\s+", "", strip_figure_tokens(right.text)).lower()
     text_score = SequenceMatcher(None, left_text, right_text, autojunk=False).ratio()
 
     left_numbers = {q.number for q in left.questions if q.number}

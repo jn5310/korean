@@ -113,6 +113,7 @@ class DifficultyClassifier:
                 f"지문 유형 후보: {', '.join(PASSAGE_TYPES)}\n"
                 f"문항 유형 후보: {', '.join(QUESTION_TYPES)}\n"
                 "가장 가까운 후보를 사용하되 정말 맞지 않을 때만 '기타'를 사용하라. "
+                "materials는 그림으로 제시된 <보기>·표 안의 글이므로 문항 내용의 일부로 함께 고려하라. "
                 "모든 입력 id를 그대로 반환하고 누락하지 마라.\n\n"
                 "<분석대상_JSON>\n"
                 + json.dumps(payload, ensure_ascii=False)
@@ -176,20 +177,27 @@ class DifficultyClassifier:
 
     @staticmethod
     def _passage_payload(passage: Passage) -> dict:
-        return {
+        payload = {
             "id": passage.id,
             "title": passage.title[:300],
             "text": passage.text[:60_000],
-            "questions": [
-                {
-                    "id": question.id,
-                    "number": question.number,
-                    "stem": question.stem[:3_000],
-                    "choices": [choice[:2_000] for choice in question.choices],
-                }
-                for question in passage.questions
-            ],
+            "questions": [],
         }
+        passage_materials = _materials(passage.images)
+        if passage_materials:
+            payload["materials"] = passage_materials
+        for question in passage.questions:
+            item = {
+                "id": question.id,
+                "number": question.number,
+                "stem": question.stem[:3_000],
+                "choices": [choice[:2_000] for choice in question.choices],
+            }
+            materials = _materials(question.images)
+            if materials:
+                item["materials"] = materials
+            payload["questions"].append(item)
+        return payload
 
     @staticmethod
     def _apply_response(passages: list[Passage], data) -> ClassificationResult:
@@ -273,6 +281,21 @@ class DifficultyClassifier:
             analyzed_passages=len(seen_passages),
             analyzed_questions=analyzed_questions,
         )
+
+
+_MATERIAL_LABELS = {"bogi": "<보기>", "table": "표", "figure": "그림", "image": "그림"}
+
+
+def _materials(images) -> list[dict]:
+    """그림으로만 표시되는 <보기>·표 안의 글자도 난이도 판단 근거로 전달한다."""
+    materials: list[dict] = []
+    for asset in images:
+        text = (getattr(asset, "text", "") or "").strip()
+        kind = getattr(asset, "kind", "")
+        if not text or kind == "page":
+            continue
+        materials.append({"type": _MATERIAL_LABELS.get(kind, "그림"), "text": text[:4_000]})
+    return materials
 
 
 def _difficulty(value) -> Optional[int]:

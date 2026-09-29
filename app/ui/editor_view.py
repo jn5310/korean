@@ -19,7 +19,7 @@ from PyQt6.QtWidgets import (
     QTextBrowser, QVBoxLayout, QWidget,
 )
 
-from ..assets import AssetError
+from ..assets import AssetError, asset_display_size
 from ..config import DEFAULT_PASSAGE_TYPES, DEFAULT_QUESTION_TYPES, DIFFICULTY_LEVELS
 from ..models import Passage, Question
 from ..services.difficulty import DifficultyClassifier
@@ -49,16 +49,33 @@ def _asset_html(asset, asset_store) -> str:
     path = asset_store.resolve(asset) if asset_store else None
     if path is None:
         return '<div style="color:#c62828;">[그림 파일을 찾을 수 없습니다]</div>'
-    width = asset.width or 500
-    height = asset.height or 300
-    display_width = min(520, max(80, width))
-    display_height = max(40, int(height * display_width / max(1, width)))
+    width, height = asset_display_size(
+        asset,
+        asset.width or 500,
+        asset.height or 300,
+        points_scale=1.4,
+        pixel_scale=1.0,
+        max_width=560,
+        max_height=900,
+    )
+    display_width = max(24, int(round(width)))
+    display_height = max(12, int(round(height)))
     url = html.escape(QUrl.fromLocalFile(str(path)).toString(), quote=True)
     alt = html.escape(asset.alt or "문제 그림", quote=True)
     return (
         f'<div style="margin:8px 0;text-align:center;"><img src="{url}" '
         f'width="{display_width}" height="{display_height}" alt="{alt}"/></div>'
     )
+
+
+def _anchor_label(anchor: str) -> str:
+    if anchor == "passage":
+        return "지문"
+    if anchor in {"stem", "after"}:
+        return "발문"
+    if anchor.startswith("choice:"):
+        return f"선택지 {'①②③④⑤'[int(anchor.split(':')[1])]}"
+    return anchor
 
 
 def _images_html(images, asset_store, anchor: str | None = None) -> str:
@@ -103,6 +120,9 @@ class EditorView(QWidget):
         self._current: Optional[Passage] = None
         self._current_q: Optional[Question] = None
         self._ai_busy = False
+        # 화면에 불러온 직후 편집기가 만든 값. 이 값과 달라졌을 때만 '직접 고친 지문'으로 표시한다.
+        self._baseline_text = ""
+        self._baseline_question: tuple = ()
 
         self._preview_timer = QTimer(self)
         self._preview_timer.setSingleShot(True)
@@ -350,6 +370,7 @@ class EditorView(QWidget):
         self.ptype_combo.setCurrentText(p.passage_type if p else "")
         self.pdiff_combo.set_value(p.difficulty if p else None)
         self.text_edit.set_content(p.text, p.text_html) if p else self.text_edit.set_content("", "")
+        self._baseline_text = self.text_edit.plain_projection()
         if p and p.source_file:
             pages = ", ".join(map(str, p.source_pages))
             self.source_label.setText(f"{p.source_file}" + (f" (p.{pages})" if pages else ""))
@@ -369,7 +390,11 @@ class EditorView(QWidget):
         p = self._current
         p.title = self.title_edit.text()
         p.passage_type = self.ptype_combo.currentText().strip()
-        p.text = self.text_edit.plain_projection()
+        text = self.text_edit.plain_projection()
+        if text != self._baseline_text:
+            # 제목·유형은 재분석 때 그대로 옮겨지므로 본문 글자를 고친 경우만 표시한다.
+            p.edited = True
+        p.text = text
         p.text_html = self.text_edit.safe_html()
         p.touch()
         self._after_edit()
@@ -431,8 +456,8 @@ class EditorView(QWidget):
             QMessageBox.information(self, "그림 삭제", "삭제할 그림이 없습니다.")
             return
         labels = [
-            f"{asset.anchor} · {asset.alt} · {asset.width}×{asset.height}"
-            for _index, asset in candidates
+            f"{index + 1}. {_anchor_label(asset.anchor)} · {asset.alt} · {asset.width}×{asset.height}"
+            for index, (_owner_index, asset) in enumerate(candidates)
         ]
         selected, ok = QInputDialog.getItem(self, "그림 삭제", "삭제할 그림", labels, 0, False)
         if not ok:
@@ -526,7 +551,7 @@ class EditorView(QWidget):
         self._preview_timer.start()
 
     def _add_passage(self) -> None:
-        p = Passage(title="새 지문")
+        p = Passage(title="새 지문", edited=True)
         self.state.library.add_passage(p)
         self._current = p
         # 필터 때문에 새 지문이 안 보이는 일이 없도록 초기화
@@ -588,7 +613,13 @@ class EditorView(QWidget):
         self.q_choices.set_blocks(q.choices, q.choices_html) if q else self.q_choices.set_blocks([], [])
         self.q_answer.setText(q.answer if q else "")
         self.q_explanation.setPlainText(q.explanation if q else "")
+        self._baseline_question = self._question_content()
         self._loading = was_loading
+
+    def _question_content(self) -> tuple:
+        """번호·발문·선택지(재분석 때 옮길 수 없는 내용)의 현재 편집기 값."""
+        choices = [plain for plain, _rich in self.q_choices.block_contents(include_empty=True)[:5]]
+        return (self.q_number.text().strip(), self.q_stem.plain_projection(), tuple(choices))
 
     def _on_question_edited(self, *_args) -> None:
         if self._loading or not self._current_q:
@@ -606,6 +637,9 @@ class EditorView(QWidget):
         q.choices_html = [rich for _plain, rich in choice_blocks]
         q.answer = self.q_answer.text().strip()
         q.explanation = self.q_explanation.toPlainText()
+        if self._current and self._question_content() != self._baseline_question:
+            # 정답·해설·유형·난이도는 재분석 때 옮겨지므로 번호·발문·선택지를 고친 경우만 표시한다.
+            self._current.edited = True
         self._after_question_edit()
 
     def _on_question_difficulty_changed(self, *_args) -> None:
@@ -628,6 +662,7 @@ class EditorView(QWidget):
             return
         qs = self._current.questions
         qs.append(Question(number=str(len(qs) + 1)))
+        self._current.edited = True
         self._reload_questions(select=len(qs) - 1)
         self._after_edit()
         self.q_stem.setFocus()
@@ -637,6 +672,7 @@ class EditorView(QWidget):
         if not self._current or row < 0:
             return
         del self._current.questions[row]
+        self._current.edited = True
         self._reload_questions(select=row)
         self._after_edit()
 
@@ -649,6 +685,7 @@ class EditorView(QWidget):
         if not 0 <= target < len(qs):
             return
         qs[row], qs[target] = qs[target], qs[row]
+        self._current.edited = True
         self._reload_questions(select=target)
         self._after_edit()
 

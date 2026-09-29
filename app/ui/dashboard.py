@@ -17,6 +17,9 @@ from ..services.analysis_pipeline import (
 )
 from ..services.difficulty import DifficultyClassifier
 from ..services.document_analyzer import GeminiDocumentAnalyzer
+from ..services.library_merge import (
+    ReanalysisGroup, find_reanalysis_groups, plan_replacements, replace_passages, source_key,
+)
 from ..services.gemini_client import ConnectionTestResult, GeminiClient, GeminiError
 from ..services.pdf_parser import PdfParser
 from .state import AppState
@@ -364,12 +367,113 @@ class DashboardView(QWidget):
         self.progress.setValue(max(0, min(current, total)))
         self.progress_label.setText(message)
 
+    def _confirm_replace(self, groups: list[ReanalysisGroup]) -> bool:
+        names = ", ".join(f"'{Path(group.source_file).name}'" for group in groups[:3])
+        if len(groups) > 3:
+            names += f" 외 {len(groups) - 3}개"
+        old_count = sum(len(group.old_passages) for group in groups)
+        new_count = sum(len(group.new_passages) for group in groups)
+        try:
+            plans = plan_replacements(self.state.library, groups)
+        except Exception as exc:  # noqa: BLE001 - 미리 계산이 실패하면 교체하지 않는다.
+            QMessageBox.warning(
+                self,
+                "이전 분석 결과 교체",
+                f"교체 결과를 미리 계산하지 못해 기존 결과를 그대로 유지합니다.\n{exc}",
+            )
+            return False
+        kept = [title for plan in plans for title in plan.kept_titles]
+        salvaged = [title for plan in plans for title in plan.salvaged_titles]
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("이전 분석 결과가 있습니다")
+        box.setText(
+            f"{names} 파일을 이전에 분석한 지문 {old_count}개가 라이브러리에 있습니다.\n"
+            f"새로 분석한 지문 {new_count}개로 교체할까요?"
+        )
+        details = [
+            "교체하면 띄어쓰기·겹친 글자·<보기> 그림이 개선된 새 결과가 들어갑니다.",
+            "입력한 정답·해설, 직접 정한 난이도·유형·제목, 직접 추가한 그림은 번호와 선택지가 같은 "
+            "새 문항으로 옮겨지고, 시험지는 그 문항들이 들어간 새 지문으로 연결됩니다.",
+        ]
+        if salvaged:
+            details.append(
+                f"옮길 곳을 확실히 찾지 못한 입력이 있거나 직접 고친 이전 지문 {len(salvaged)}개는 "
+                "지우지 않고 '[이전 분석]' 제목으로 보관합니다."
+            )
+        if kept:
+            details.append(
+                f"새 결과와 짝이 맞지 않는 이전 지문 {len(kept)}개는 입력한 내용·시험지 구성이 있거나 "
+                "이전 버전에서 고쳤을 수 있어 그대로 남겨 둡니다."
+            )
+        details.append("'기존 결과 유지'를 누르면 라이브러리를 그대로 두고 이 파일의 새 결과는 추가하지 않습니다.")
+        box.setInformativeText("\n".join(details))
+        preserved = [*salvaged, *kept]
+        if preserved:
+            box.setDetailedText("보관·유지되는 이전 지문:\n" + "\n".join(f"• {title}" for title in preserved))
+        replace_button = box.addButton("기존 결과 교체", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("기존 결과 유지", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(replace_button)
+        box.exec()
+        return box.clickedButton() is replace_button
+
     def _on_analysis_done(self, batch: AnalysisBatchResult) -> None:
-        known_passages = list(self.state.library.passages)
         added_passages = []
         enriched_passages = []
         duplicate_count = 0
+        replaced_old = 0
+        replaced_new: list = []
+        replace_notes: list[str] = []
+        replaced_sources: set[str] = set()
+        skipped_sources: set[str] = set()
+        groups = find_reanalysis_groups(self.state.library, batch.results)
+        if groups and not self._confirm_replace(groups):
+            for group in groups:
+                skipped_sources.add(source_key(group.source_file))
+                replace_notes.append(
+                    f"[{Path(group.source_file).name}] 기존 결과를 유지하여 새 분석 결과는 추가하지 않았습니다."
+                )
+            groups = []
+        if groups:
+            for group in groups:
+                summary = replace_passages(self.state.library, group.old_passages, group.new_passages)
+                replaced_sources.add(source_key(group.source_file))
+                replaced_old += summary.removed
+                added_passages.extend(group.new_passages)
+                replaced_new.extend(group.new_passages)
+                name = Path(group.source_file).name
+                if summary.remapped_refs:
+                    replace_notes.append(
+                        f"[{name}] 시험지에 담긴 지문 {summary.remapped_refs}개를 새 지문으로 연결했습니다."
+                    )
+                if summary.dropped_refs:
+                    replace_notes.append(
+                        f"[{name}] 새 결과에서 대응 지문을 찾지 못해 시험지에서 {summary.dropped_refs}개를 뺐습니다."
+                    )
+                if summary.carried_items:
+                    replace_notes.append(
+                        f"[{name}] 정답·해설·수동 난이도 등 {summary.carried_items}개 항목을 옮겼습니다."
+                    )
+                if summary.kept_titles:
+                    shown = ", ".join(summary.kept_titles[:5])
+                    more = f" 외 {len(summary.kept_titles) - 5}개" if len(summary.kept_titles) > 5 else ""
+                    replace_notes.append(
+                        f"[{name}] 새 결과와 짝이 맞지 않아 이전 지문을 그대로 남겼습니다(입력한 내용 보존): {shown}{more}"
+                    )
+                if summary.salvaged_titles:
+                    shown = ", ".join(summary.salvaged_titles[:5])
+                    more = f" 외 {len(summary.salvaged_titles) - 5}개" if len(summary.salvaged_titles) > 5 else ""
+                    replace_notes.append(
+                        f"[{name}] 옮기지 못한 입력이나 직접 고친 내용이 있어 이전 지문을 '[이전 분석]' 제목으로 "
+                        f"보관했습니다: {shown}{more}"
+                    )
+
+        known_passages = list(self.state.library.passages)
         for result in batch.results:
+            key = source_key(result.source_file)
+            if key in replaced_sources or key in skipped_sources:
+                self.state.config_manager.add_recent_file(result.source_file)
+                continue
             for passage in result.passages:
                 existing = next(
                     (item for item in known_passages if passages_equivalent(item, passage)),
@@ -393,7 +497,7 @@ class DashboardView(QWidget):
         ]
         self._rebuild_file_list()
 
-        warnings = list(batch.warnings)
+        warnings = [*replace_notes, *batch.warnings]
         model_changed = bool(batch.model_changed and batch.selected_model)
         if model_changed and self.state.config.gemini_model == batch.original_model:
             previous = self.state.config.gemini_model
@@ -414,15 +518,17 @@ class DashboardView(QWidget):
                 warnings.append(f"최근 파일/모델 설정 저장 실패: {exc}")
 
         changed_passages = [*added_passages, *enriched_passages]
-        if changed_passages:
+        if changed_passages or replaced_old:
             self.state.mark_dirty()
             try:
                 self.state.save_library()  # 분석 직후 자동 저장하여 결과 유실 방지
             except OSError as exc:
                 warnings.append(f"자동 저장 실패: {exc}. Ctrl+S로 다시 저장해 주세요.")
             question_count = sum(len(passage.questions) for passage in added_passages)
+            replaced_text = f", 이전 지문 {replaced_old}개 교체" if replaced_old else ""
             self.state.status(
-                f"분석 완료: 새 지문 {len(added_passages)}개, 서식 보강 {len(enriched_passages)}개, 문제 {question_count}개",
+                f"분석 완료: 새 지문 {len(added_passages)}개, 서식 보강 {len(enriched_passages)}개, "
+                f"문제 {question_count}개{replaced_text}",
                 7000,
             )
         elif batch.failures:
@@ -431,7 +537,8 @@ class DashboardView(QWidget):
             self.state.status("새로 추가할 지문이 없습니다.", 5000)
 
         self._show_analysis_summary(
-            batch, added_passages, len(enriched_passages), duplicate_count, warnings
+            batch, added_passages, len(enriched_passages), duplicate_count, warnings,
+            replaced_old, replaced_new,
         )
         if changed_passages:
             self.analysis_completed.emit(changed_passages[0].id)
@@ -451,8 +558,11 @@ class DashboardView(QWidget):
         enriched_count: int,
         duplicate_count: int,
         warnings: list[str],
+        replaced_old: int = 0,
+        replaced_new: list | None = None,
     ) -> None:
         question_count = sum(len(passage.questions) for passage in added_passages)
+        replaced_new = replaced_new or []
         ocr_pages = sum(result.ocr_page_count for result in batch.results)
         ai_files = sum(result.used_ai for result in batch.results)
         box = QMessageBox(self)
@@ -460,10 +570,21 @@ class DashboardView(QWidget):
         box.setIcon(
             QMessageBox.Icon.Warning if batch.failures or warnings else QMessageBox.Icon.Information
         )
-        box.setText(
-            f"새 지문 {len(added_passages)}개·문제 {question_count}개를 추가하고, "
-            f"기존 지문 {enriched_count}개의 서식·그림을 보강했습니다."
-        )
+        if replaced_old:
+            replaced_questions = sum(len(passage.questions) for passage in replaced_new)
+            text = (
+                f"이전 지문 {replaced_old}개를 새 분석 결과(지문 {len(replaced_new)}개·문제 "
+                f"{replaced_questions}개)로 교체했습니다."
+            )
+            other = len(added_passages) - len(replaced_new)
+            if other > 0:
+                text += f"\n다른 파일에서 새 지문 {other}개도 추가했습니다."
+            box.setText(text)
+        else:
+            box.setText(
+                f"새 지문 {len(added_passages)}개·문제 {question_count}개를 추가하고, "
+                f"기존 지문 {enriched_count}개의 서식·그림을 보강했습니다."
+            )
         details = [
             f"성공 파일: {len(batch.results)}개",
             f"실패 파일: {len(batch.failures)}개",

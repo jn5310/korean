@@ -15,6 +15,32 @@ class AssetError(Exception):
     pass
 
 
+def asset_display_size(
+    asset: MediaAsset,
+    pixel_width: float,
+    pixel_height: float,
+    *,
+    points_scale: float,
+    pixel_scale: float,
+    max_width: float,
+    max_height: float,
+) -> tuple[float, float]:
+    """PDF 원본에서의 실제 크기(pt)를 기준으로 표시 크기를 정한다.
+
+    PDF에서 잘라낸 그림은 bbox 폭(pt)×points_scale, 직접 추가한 그림은 픽셀×pixel_scale을
+    쓰고, 가로·세로 최대 크기를 넘으면 비율을 유지해 줄인다.
+    """
+    if pixel_width <= 0 or pixel_height <= 0:
+        return 0.0, 0.0
+    natural = asset.point_width * points_scale if asset.point_width > 0 else pixel_width * pixel_scale
+    width = max(1.0, min(max_width, natural))
+    height = width * pixel_height / pixel_width
+    if height > max_height:
+        width *= max_height / height
+        height = max_height
+    return width, height
+
+
 class AssetStore:
     MAX_INPUT_BYTES = 25 * 1024 * 1024
     MAX_PIXELS = 40_000_000
@@ -33,6 +59,8 @@ class AssetStore:
         anchor: str = "after",
         offset: int = 0,
         alt: str = "문제 그림",
+        kind: str = "",
+        text: str = "",
     ) -> MediaAsset:
         if not data or len(data) > self.MAX_INPUT_BYTES:
             raise AssetError("이미지가 비어 있거나 25MB 제한을 초과했습니다.")
@@ -96,6 +124,8 @@ class AssetStore:
             anchor=anchor,
             offset=offset,
             alt=alt,
+            kind=kind,
+            text=text,
         )
 
     def import_file(self, path: Path, **metadata) -> MediaAsset:
