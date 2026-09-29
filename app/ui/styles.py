@@ -50,4 +50,12 @@ QPushButton:disabled { color: #b0bec5; }
 QPushButton#Primary { background: #0288d1; color: white; border: none; }
 QPushButton#Primary:hover { background: #0277bd; }
 QPushButton#Primary:disabled { background: #90caf9; }
+
+QTextEdit#RichTextEdit {
+    background: white; border: 1px solid #cfd8dc; border-radius: 3px; padding: 4px;
+}
+QTextEdit#RichTextEdit:focus { border: 1px solid #0288d1; }
+#RichTextToolbar { background: #f5f7f8; border-radius: 3px; }
+#RichTextToolbar QToolButton { padding: 3px 7px; border: 1px solid #cfd8dc; background: white; }
+#RichTextToolbar QToolButton:checked { background: #b3e5fc; border-color: #0288d1; }
 """

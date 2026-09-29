@@ -69,6 +69,12 @@ class SettingsDialog(QDialog):
         self.retries_spin.setSuffix(" 회")
         form.addRow("재시도 횟수", self.retries_spin)
 
+        self.rpm_spin = QSpinBox()
+        self.rpm_spin.setRange(1, 60)
+        self.rpm_spin.setSuffix(" 회/분")
+        self.rpm_spin.setToolTip("무료 tier 한도에 맞춰 보수적으로 설정하세요. 기본값은 10회/분입니다.")
+        form.addRow("분당 최대 요청", self.rpm_spin)
+
         test_row = QHBoxLayout()
         self.test_btn = QPushButton("연결 테스트")
         self.test_btn.clicked.connect(self._test_connection)
@@ -79,7 +85,7 @@ class SettingsDialog(QDialog):
         form.addRow("", test_row)
         layout.addWidget(gemini_box)
 
-        # --- OCR (Step 2 에서 사용) ---
+        # --- OCR (스캔본 PDF 로컬 인식) ---
         ocr_box = QGroupBox("OCR (스캔본 PDF)")
         ocr_form = QFormLayout(ocr_box)
         tess_row = QHBoxLayout()
@@ -93,10 +99,18 @@ class SettingsDialog(QDialog):
         self.ocr_lang_edit = QLineEdit()
         ocr_form.addRow("OCR 언어", self.ocr_lang_edit)
         self.ocr_dpi_spin = QSpinBox()
-        self.ocr_dpi_spin.setRange(100, 600)
+        self.ocr_dpi_spin.setRange(150, 600)
         self.ocr_dpi_spin.setSingleStep(50)
         self.ocr_dpi_spin.setSuffix(" dpi")
         ocr_form.addRow("렌더링 해상도", self.ocr_dpi_spin)
+        self.ocr_timeout_spin = QSpinBox()
+        self.ocr_timeout_spin.setRange(10, 600)
+        self.ocr_timeout_spin.setSuffix(" 초/페이지")
+        ocr_form.addRow("OCR 제한 시간", self.ocr_timeout_spin)
+        ocr_note = QLabel("Tesseract가 없어도 API Key가 설정되어 있으면 Gemini 문서 비전으로 스캔 PDF를 분석합니다.")
+        ocr_note.setWordWrap(True)
+        ocr_note.setObjectName("Muted")
+        ocr_form.addRow("", ocr_note)
         layout.addWidget(ocr_box)
 
         buttons = QDialogButtonBox(
@@ -114,9 +128,11 @@ class SettingsDialog(QDialog):
         self.model_combo.setCurrentText(cfg.gemini_model)
         self.timeout_spin.setValue(cfg.gemini_timeout_sec)
         self.retries_spin.setValue(cfg.gemini_max_retries)
+        self.rpm_spin.setValue(cfg.gemini_requests_per_minute)
         self.tesseract_edit.setText(cfg.tesseract_cmd)
         self.ocr_lang_edit.setText(cfg.ocr_languages)
         self.ocr_dpi_spin.setValue(cfg.ocr_dpi)
+        self.ocr_timeout_spin.setValue(cfg.ocr_timeout_sec)
 
     # ------------------------------------------------------------------
     def _toggle_key_visibility(self, visible: bool) -> None:
@@ -159,6 +175,10 @@ class SettingsDialog(QDialog):
         )
 
     def _on_test_result(self, result: ConnectionTestResult) -> None:
+        if result.ok and result.model:
+            if self.model_combo.findText(result.model) < 0:
+                self.model_combo.addItem(result.model)
+            self.model_combo.setCurrentText(result.model)
         self._show_result(result.ok, result.message)
 
     def _show_result(self, ok: bool, message: str) -> None:
@@ -197,8 +217,10 @@ class SettingsDialog(QDialog):
         cfg.gemini_model = self.model_combo.currentText().strip() or cfg.gemini_model
         cfg.gemini_timeout_sec = self.timeout_spin.value()
         cfg.gemini_max_retries = self.retries_spin.value()
+        cfg.gemini_requests_per_minute = self.rpm_spin.value()
         cfg.tesseract_cmd = self.tesseract_edit.text().strip()
         cfg.ocr_languages = self.ocr_lang_edit.text().strip() or "kor+eng"
         cfg.ocr_dpi = self.ocr_dpi_spin.value()
+        cfg.ocr_timeout_sec = self.ocr_timeout_spin.value()
         self.state.save_config()
         self.accept()

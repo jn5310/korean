@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from copy import deepcopy
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, pyqtSignal
@@ -11,8 +12,16 @@ from PyQt6.QtWidgets import (
     QListWidgetItem, QMessageBox, QProgressBar, QPushButton, QVBoxLayout, QWidget,
 )
 
-from ..services.gemini_client import ConnectionTestResult, GeminiError
-from ..services.pdf_parser import ParseResult, PdfParser
+from ..services.analysis_pipeline import (
+    AnalysisBatchResult, AnalysisPipeline, merge_rich_content, passages_equivalent,
+)
+from ..services.difficulty import DifficultyClassifier
+from ..services.document_analyzer import GeminiDocumentAnalyzer
+from ..services.library_merge import (
+    ReanalysisGroup, find_reanalysis_groups, plan_replacements, replace_passages, source_key,
+)
+from ..services.gemini_client import ConnectionTestResult, GeminiClient, GeminiError
+from ..services.pdf_parser import PdfParser
 from .state import AppState
 from .styles import difficulty_color
 from .widgets import Card
@@ -21,6 +30,13 @@ from .widgets import Card
 def _repolish(widget: QWidget) -> None:
     widget.style().unpolish(widget)
     widget.style().polish(widget)
+
+
+def _normalized_path(path: str) -> str:
+    try:
+        return str(Path(path).resolve()).casefold()
+    except OSError:
+        return str(Path(path).absolute()).casefold()
 
 
 class PdfDropArea(QLabel):
@@ -44,7 +60,7 @@ class PdfDropArea(QLabel):
         _repolish(self)
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
-        if self._pdf_paths(event):
+        if self.isEnabled() and self._pdf_paths(event):
             event.acceptProposedAction()
             self._set_active(True)
         else:
@@ -63,12 +79,13 @@ class PdfDropArea(QLabel):
 
 class DashboardView(QWidget):
     open_settings_requested = pyqtSignal()
-    analysis_completed = pyqtSignal()        # 분석 후 편집 화면으로 이동할 때 사용
+    analysis_completed = pyqtSignal(str)    # 새로 추가한 첫 지문 ID
 
     def __init__(self, state: AppState, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.state = state
         self._pending_files: list[str] = []
+        self._busy = False
         self._build_ui()
         state.config_changed.connect(self.refresh_api_status)
         state.library_changed.connect(self.refresh_stats)
@@ -145,15 +162,15 @@ class DashboardView(QWidget):
         pdf_card.body.addWidget(self.file_list, 1)
 
         row = QHBoxLayout()
-        add_btn = QPushButton("PDF 추가…")
-        add_btn.clicked.connect(self._browse_files)
-        remove_btn = QPushButton("선택 제거")
-        remove_btn.clicked.connect(self._remove_selected)
+        self.add_btn = QPushButton("PDF 추가…")
+        self.add_btn.clicked.connect(self._browse_files)
+        self.remove_btn = QPushButton("선택 제거")
+        self.remove_btn.clicked.connect(self._remove_selected)
         self.analyze_btn = QPushButton("분석 시작")
         self.analyze_btn.setObjectName("Primary")
         self.analyze_btn.clicked.connect(self._start_analysis)
-        row.addWidget(add_btn)
-        row.addWidget(remove_btn)
+        row.addWidget(self.add_btn)
+        row.addWidget(self.remove_btn)
         row.addStretch()
         row.addWidget(self.analyze_btn)
         pdf_card.body.addLayout(row)
@@ -210,6 +227,16 @@ class DashboardView(QWidget):
 
     def _on_test_result(self, result: ConnectionTestResult) -> None:
         if result.ok:
+            if (
+                result.model_changed
+                and result.model
+                and self.state.config.gemini_model == result.original_model
+            ):
+                self.state.config.gemini_model = result.model
+                try:
+                    self.state.save_config()
+                except OSError as exc:
+                    QMessageBox.warning(self, "모델 저장 실패", str(exc))
             self.state.status(result.message, 6000)
             QMessageBox.information(self, "연결 테스트", result.message)
         else:
@@ -230,6 +257,8 @@ class DashboardView(QWidget):
 
     # --- 파일 목록 -------------------------------------------------------
     def add_files(self, paths: list[str]) -> None:
+        if self._busy:
+            return
         added = 0
         for path in paths:
             if path in self._pending_files:
@@ -260,27 +289,56 @@ class DashboardView(QWidget):
         self._update_analyze_enabled()
 
     def _update_analyze_enabled(self) -> None:
-        self.analyze_btn.setEnabled(bool(self._pending_files))
+        self.analyze_btn.setEnabled(bool(self._pending_files) and not self._busy)
 
-    # --- 분석 (Step 2 에서 실제 구현) -------------------------------------
+    # --- PDF/OCR/Gemini 통합 분석 -----------------------------------------
     def _start_analysis(self) -> None:
-        cfg = self.state.config
-        parser = PdfParser(cfg.tesseract_cmd, cfg.ocr_languages, cfg.ocr_dpi)
-        files = list(self._pending_files)
+        if self._busy or not self._pending_files:
+            return
+        cfg = deepcopy(self.state.config)  # 분석 중 설정 변경의 영향을 받지 않는 snapshot
+        api_key = self.state.config_manager.effective_api_key
+        files = [Path(path) for path in self._pending_files]
 
         def job(progress):
-            results = []
-            for i, path in enumerate(files, start=1):
-                progress(i - 1, len(files), f"{Path(path).name} 분석 중…")
-                results.append(parser.parse(Path(path)))
-            progress(len(files), len(files), "완료")
-            return results
+            parser = PdfParser(
+                cfg.tesseract_cmd,
+                cfg.ocr_languages,
+                cfg.ocr_dpi,
+                ocr_timeout_sec=getattr(cfg, "ocr_timeout_sec", 90),
+                asset_store=self.state.asset_store,
+            )
+            analyzer = None
+            classifier = None
+            client = None
+            setup_warning = ""
+            if api_key:
+                try:
+                    client = GeminiClient(
+                        api_key=api_key,
+                        model=cfg.gemini_model,
+                        timeout_sec=cfg.gemini_timeout_sec,
+                        max_retries=cfg.gemini_max_retries,
+                        requests_per_minute=getattr(cfg, "gemini_requests_per_minute", 10),
+                    )
+                    analyzer = GeminiDocumentAnalyzer(client)
+                    classifier = DifficultyClassifier(client)
+                except GeminiError as exc:
+                    setup_warning = f"Gemini 초기화 실패로 로컬 분석만 수행했습니다: {exc}"
+            pipeline = AnalysisPipeline(
+                parser,
+                document_analyzer=analyzer,
+                classifier=classifier,
+            )
+            batch = pipeline.analyze_files(files, progress=progress)
+            if setup_warning:
+                batch.general_warnings.append(setup_warning)
+            if client is not None:
+                batch.selected_model = client.model
+                batch.original_model = cfg.gemini_model
+                batch.model_changed = client.model != cfg.gemini_model
+            return batch
 
-        self.analyze_btn.setEnabled(False)
-        self.progress.setVisible(True)
-        self.progress_label.setVisible(True)
-        self.progress.setRange(0, len(files))
-        self.progress.setValue(0)
+        self._set_analysis_busy(True, len(files) * 1000)
         self.state.run_async(
             job,
             on_progress=self._on_progress,
@@ -289,31 +347,263 @@ class DashboardView(QWidget):
             on_finished=self._on_analysis_finished,
         )
 
+    def _set_analysis_busy(self, busy: bool, maximum: int = 1) -> None:
+        self._busy = busy
+        self.drop_area.setEnabled(not busy)
+        self.file_list.setEnabled(not busy)
+        self.add_btn.setEnabled(not busy)
+        self.remove_btn.setEnabled(not busy)
+        self.analyze_btn.setText("분석 중…" if busy else "분석 시작")
+        self.progress.setVisible(busy)
+        self.progress_label.setVisible(busy)
+        if busy:
+            self.progress.setRange(0, max(1, maximum))
+            self.progress.setValue(0)
+            self.progress_label.setText("분석 준비 중…")
+        self._update_analyze_enabled()
+
     def _on_progress(self, current: int, total: int, message: str) -> None:
         self.progress.setMaximum(max(total, 1))
-        self.progress.setValue(current)
+        self.progress.setValue(max(0, min(current, total)))
         self.progress_label.setText(message)
 
-    def _on_analysis_done(self, results: list[ParseResult]) -> None:
-        count = 0
-        for result in results:
+    def _confirm_replace(self, groups: list[ReanalysisGroup]) -> bool:
+        names = ", ".join(f"'{Path(group.source_file).name}'" for group in groups[:3])
+        if len(groups) > 3:
+            names += f" 외 {len(groups) - 3}개"
+        old_count = sum(len(group.old_passages) for group in groups)
+        new_count = sum(len(group.new_passages) for group in groups)
+        try:
+            plans = plan_replacements(self.state.library, groups)
+        except Exception as exc:  # noqa: BLE001 - 미리 계산이 실패하면 교체하지 않는다.
+            QMessageBox.warning(
+                self,
+                "이전 분석 결과 교체",
+                f"교체 결과를 미리 계산하지 못해 기존 결과를 그대로 유지합니다.\n{exc}",
+            )
+            return False
+        kept = [title for plan in plans for title in plan.kept_titles]
+        salvaged = [title for plan in plans for title in plan.salvaged_titles]
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("이전 분석 결과가 있습니다")
+        box.setText(
+            f"{names} 파일을 이전에 분석한 지문 {old_count}개가 라이브러리에 있습니다.\n"
+            f"새로 분석한 지문 {new_count}개로 교체할까요?"
+        )
+        details = [
+            "교체하면 띄어쓰기·겹친 글자·<보기> 그림이 개선된 새 결과가 들어갑니다.",
+            "입력한 정답·해설, 직접 정한 난이도·유형·제목, 직접 추가한 그림은 번호와 선택지가 같은 "
+            "새 문항으로 옮겨지고, 시험지는 그 문항들이 들어간 새 지문으로 연결됩니다.",
+        ]
+        if salvaged:
+            details.append(
+                f"옮길 곳을 확실히 찾지 못한 입력이 있거나 직접 고친 이전 지문 {len(salvaged)}개는 "
+                "지우지 않고 '[이전 분석]' 제목으로 보관합니다."
+            )
+        if kept:
+            details.append(
+                f"새 결과와 짝이 맞지 않는 이전 지문 {len(kept)}개는 입력한 내용·시험지 구성이 있거나 "
+                "이전 버전에서 고쳤을 수 있어 그대로 남겨 둡니다."
+            )
+        details.append("'기존 결과 유지'를 누르면 라이브러리를 그대로 두고 이 파일의 새 결과는 추가하지 않습니다.")
+        box.setInformativeText("\n".join(details))
+        preserved = [*salvaged, *kept]
+        if preserved:
+            box.setDetailedText("보관·유지되는 이전 지문:\n" + "\n".join(f"• {title}" for title in preserved))
+        replace_button = box.addButton("기존 결과 교체", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("기존 결과 유지", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(replace_button)
+        box.exec()
+        return box.clickedButton() is replace_button
+
+    def _on_analysis_done(self, batch: AnalysisBatchResult) -> None:
+        added_passages = []
+        enriched_passages = []
+        duplicate_count = 0
+        replaced_old = 0
+        replaced_new: list = []
+        replace_notes: list[str] = []
+        replaced_sources: set[str] = set()
+        skipped_sources: set[str] = set()
+        groups = find_reanalysis_groups(self.state.library, batch.results)
+        if groups and not self._confirm_replace(groups):
+            for group in groups:
+                skipped_sources.add(source_key(group.source_file))
+                replace_notes.append(
+                    f"[{Path(group.source_file).name}] 기존 결과를 유지하여 새 분석 결과는 추가하지 않았습니다."
+                )
+            groups = []
+        if groups:
+            for group in groups:
+                summary = replace_passages(self.state.library, group.old_passages, group.new_passages)
+                replaced_sources.add(source_key(group.source_file))
+                replaced_old += summary.removed
+                added_passages.extend(group.new_passages)
+                replaced_new.extend(group.new_passages)
+                name = Path(group.source_file).name
+                if summary.remapped_refs:
+                    replace_notes.append(
+                        f"[{name}] 시험지에 담긴 지문 {summary.remapped_refs}개를 새 지문으로 연결했습니다."
+                    )
+                if summary.dropped_refs:
+                    replace_notes.append(
+                        f"[{name}] 새 결과에서 대응 지문을 찾지 못해 시험지에서 {summary.dropped_refs}개를 뺐습니다."
+                    )
+                if summary.carried_items:
+                    replace_notes.append(
+                        f"[{name}] 정답·해설·수동 난이도 등 {summary.carried_items}개 항목을 옮겼습니다."
+                    )
+                if summary.kept_titles:
+                    shown = ", ".join(summary.kept_titles[:5])
+                    more = f" 외 {len(summary.kept_titles) - 5}개" if len(summary.kept_titles) > 5 else ""
+                    replace_notes.append(
+                        f"[{name}] 새 결과와 짝이 맞지 않아 이전 지문을 그대로 남겼습니다(입력한 내용 보존): {shown}{more}"
+                    )
+                if summary.salvaged_titles:
+                    shown = ", ".join(summary.salvaged_titles[:5])
+                    more = f" 외 {len(summary.salvaged_titles) - 5}개" if len(summary.salvaged_titles) > 5 else ""
+                    replace_notes.append(
+                        f"[{name}] 옮기지 못한 입력이나 직접 고친 내용이 있어 이전 지문을 '[이전 분석]' 제목으로 "
+                        f"보관했습니다: {shown}{more}"
+                    )
+
+        known_passages = list(self.state.library.passages)
+        for result in batch.results:
+            key = source_key(result.source_file)
+            if key in replaced_sources or key in skipped_sources:
+                self.state.config_manager.add_recent_file(result.source_file)
+                continue
             for passage in result.passages:
+                existing = next(
+                    (item for item in known_passages if passages_equivalent(item, passage)),
+                    None,
+                )
+                if existing is not None:
+                    if merge_rich_content(existing, passage):
+                        enriched_passages.append(existing)
+                    else:
+                        duplicate_count += 1
+                    continue
+                known_passages.append(passage)
                 self.state.library.add_passage(passage)
-                count += 1
+                added_passages.append(passage)
             self.state.config_manager.add_recent_file(result.source_file)
-        self._pending_files.clear()
+
+        # 성공한 파일만 대기 목록에서 제거하고 실패 파일은 재시도할 수 있게 남긴다.
+        successful = {_normalized_path(path) for path in batch.successful_paths}
+        self._pending_files = [
+            path for path in self._pending_files if _normalized_path(path) not in successful
+        ]
+        self._rebuild_file_list()
+
+        warnings = [*replace_notes, *batch.warnings]
+        model_changed = bool(batch.model_changed and batch.selected_model)
+        if model_changed and self.state.config.gemini_model == batch.original_model:
+            previous = self.state.config.gemini_model
+            self.state.config.gemini_model = batch.selected_model
+            warnings.append(
+                f"기존 Gemini 모델({previous})을 사용할 수 없어 {batch.selected_model}로 자동 변경했습니다."
+            )
+        elif model_changed and self.state.config.gemini_model != batch.original_model:
+            warnings.append("분석 중 사용자가 변경한 Gemini 모델 설정을 유지했습니다.")
+            model_changed = False
+        if duplicate_count:
+            warnings.append(f"이미 라이브러리에 있는 중복 지문 {duplicate_count}개는 추가하지 않았습니다.")
+
+        if batch.results or model_changed:
+            try:
+                self.state.save_config()
+            except OSError as exc:
+                warnings.append(f"최근 파일/모델 설정 저장 실패: {exc}")
+
+        changed_passages = [*added_passages, *enriched_passages]
+        if changed_passages or replaced_old:
+            self.state.mark_dirty()
+            try:
+                self.state.save_library()  # 분석 직후 자동 저장하여 결과 유실 방지
+            except OSError as exc:
+                warnings.append(f"자동 저장 실패: {exc}. Ctrl+S로 다시 저장해 주세요.")
+            question_count = sum(len(passage.questions) for passage in added_passages)
+            replaced_text = f", 이전 지문 {replaced_old}개 교체" if replaced_old else ""
+            self.state.status(
+                f"분석 완료: 새 지문 {len(added_passages)}개, 서식 보강 {len(enriched_passages)}개, "
+                f"문제 {question_count}개{replaced_text}",
+                7000,
+            )
+        elif batch.failures:
+            self.state.status("PDF 분석에 실패했습니다. 상세 내용을 확인해 주세요.", 7000)
+        else:
+            self.state.status("새로 추가할 지문이 없습니다.", 5000)
+
+        self._show_analysis_summary(
+            batch, added_passages, len(enriched_passages), duplicate_count, warnings,
+            replaced_old, replaced_new,
+        )
+        if changed_passages:
+            self.analysis_completed.emit(changed_passages[0].id)
+
+    def _rebuild_file_list(self) -> None:
         self.file_list.clear()
-        self.state.mark_dirty()
-        self.state.status(f"지문 {count}개를 추출했습니다.")
-        self.analysis_completed.emit()
+        for path in self._pending_files:
+            item = QListWidgetItem(Path(path).name)
+            item.setToolTip(path)
+            item.setData(Qt.ItemDataRole.UserRole, path)
+            self.file_list.addItem(item)
+
+    def _show_analysis_summary(
+        self,
+        batch: AnalysisBatchResult,
+        added_passages: list,
+        enriched_count: int,
+        duplicate_count: int,
+        warnings: list[str],
+        replaced_old: int = 0,
+        replaced_new: list | None = None,
+    ) -> None:
+        question_count = sum(len(passage.questions) for passage in added_passages)
+        replaced_new = replaced_new or []
+        ocr_pages = sum(result.ocr_page_count for result in batch.results)
+        ai_files = sum(result.used_ai for result in batch.results)
+        box = QMessageBox(self)
+        box.setWindowTitle("PDF 분석 결과")
+        box.setIcon(
+            QMessageBox.Icon.Warning if batch.failures or warnings else QMessageBox.Icon.Information
+        )
+        if replaced_old:
+            replaced_questions = sum(len(passage.questions) for passage in replaced_new)
+            text = (
+                f"이전 지문 {replaced_old}개를 새 분석 결과(지문 {len(replaced_new)}개·문제 "
+                f"{replaced_questions}개)로 교체했습니다."
+            )
+            other = len(added_passages) - len(replaced_new)
+            if other > 0:
+                text += f"\n다른 파일에서 새 지문 {other}개도 추가했습니다."
+            box.setText(text)
+        else:
+            box.setText(
+                f"새 지문 {len(added_passages)}개·문제 {question_count}개를 추가하고, "
+                f"기존 지문 {enriched_count}개의 서식·그림을 보강했습니다."
+            )
+        details = [
+            f"성공 파일: {len(batch.results)}개",
+            f"실패 파일: {len(batch.failures)}개",
+            f"OCR 사용 페이지: {ocr_pages}개",
+            f"Gemini 교차 분석 파일: {ai_files}개",
+            f"서식·그림 보강 지문: {enriched_count}개",
+            f"중복 제외 지문: {duplicate_count}개",
+        ]
+        box.setInformativeText("\n".join(details))
+        if warnings:
+            box.setDetailedText("\n".join(f"• {warning}" for warning in warnings))
+        box.exec()
 
     def _on_analysis_error(self, exc: Exception) -> None:
-        if isinstance(exc, NotImplementedError):
-            QMessageBox.information(self, "분석", f"{exc}\n\n지금은 '편집·검수' 화면에서 지문을 직접 입력할 수 있습니다.")
-        else:
-            QMessageBox.critical(self, "분석 오류", str(exc))
+        QMessageBox.critical(
+            self,
+            "분석 오류",
+            f"분석 작업을 시작하지 못했습니다.\n\n{exc}\n\n오류 화면을 캡처해 보내 주세요.",
+        )
 
     def _on_analysis_finished(self) -> None:
-        self.progress.setVisible(False)
-        self.progress_label.setVisible(False)
-        self._update_analyze_enabled()
+        self._set_analysis_busy(False)
