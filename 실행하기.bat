@@ -1,113 +1,80 @@
 @echo off
 setlocal EnableExtensions
-chcp 65001 >nul
-title 지문·문제 재구성 스튜디오
+cd /d "%~dp0"
 
-rem 이 파일이 있는 프로젝트 폴더로 자동 이동합니다.
-pushd "%~dp0"
+if not exist "main.py" goto FILE_ERROR
+if not exist "requirements.txt" goto FILE_ERROR
+if not exist "windows_launcher.pyw" goto FILE_ERROR
 
-if not exist "main.py" goto missing_files
-if not exist "requirements.txt" goto missing_files
-if not exist "windows_launcher.pyw" goto missing_files
+if not exist ".venv\Scripts\python.exe" goto CREATE_ENV
 
-rem 이미 준비된 경우 설치 과정을 건너뜁니다.
-if exist ".venv\Scripts\python.exe" (
-    ".venv\Scripts\python.exe" -c "import PyQt6; from google import genai; import pdfplumber, pypdf, pytesseract, PIL, reportlab" >nul 2>nul
-    if not errorlevel 1 goto launch
-)
+:CHECK_PACKAGES
+".venv\Scripts\python.exe" -c "import PyQt6; from google import genai; import pdfplumber, pypdf, pytesseract, PIL, reportlab" >nul 2>&1
+if not errorlevel 1 goto START_APP
+goto INSTALL_PACKAGES
 
+:CREATE_ENV
 cls
-echo ============================================================
-echo   지문·문제 재구성 스튜디오 - 최초 실행 준비
-echo ============================================================
+echo ================================================
+echo   First-time setup - please wait
+echo ================================================
 echo.
-echo 처음 한 번만 필요한 설치입니다. 잠시 기다려 주세요.
-echo 설치가 끝나면 앱이 자동으로 열립니다.
-echo.
+echo [1/3] Preparing Python...
+where py >nul 2>&1
+if not errorlevel 1 goto CREATE_WITH_PY
+where python >nul 2>&1
+if not errorlevel 1 goto CREATE_WITH_PYTHON
+goto NO_PYTHON
 
-if exist ".venv\Scripts\python.exe" goto install_packages
-
-where py >nul 2>nul
-if not errorlevel 1 goto create_with_py
-
-where python >nul 2>nul
-if not errorlevel 1 goto create_with_python
-
-goto no_python
-
-:create_with_py
-echo [1/3] Python 환경을 준비하는 중...
+:CREATE_WITH_PY
 py -3 -m venv ".venv"
-if errorlevel 1 goto venv_error
-goto install_packages
+if errorlevel 1 goto SETUP_ERROR
+goto INSTALL_PACKAGES
 
-:create_with_python
-echo [1/3] Python 환경을 준비하는 중...
+:CREATE_WITH_PYTHON
 python -m venv ".venv"
-if errorlevel 1 goto venv_error
-goto install_packages
+if errorlevel 1 goto SETUP_ERROR
+goto INSTALL_PACKAGES
 
-:install_packages
-echo [2/3] 필요한 프로그램을 설치하는 중...
-".venv\Scripts\python.exe" -m pip install --disable-pip-version-check --upgrade pip
-if errorlevel 1 goto install_error
+:INSTALL_PACKAGES
+echo [2/3] Installing required packages...
 ".venv\Scripts\python.exe" -m pip install --disable-pip-version-check -r "requirements.txt"
-if errorlevel 1 goto install_error
+if errorlevel 1 goto SETUP_ERROR
+goto START_APP
 
-goto launch
-
-:launch
-echo [3/3] 앱을 실행합니다...
+:START_APP
+echo [3/3] Starting the app...
 start "" ".venv\Scripts\pythonw.exe" "windows_launcher.pyw"
-if errorlevel 1 goto launch_error
-popd
+if errorlevel 1 goto START_ERROR
 exit /b 0
 
-:no_python
+:NO_PYTHON
 cls
-echo Python이 설치되어 있지 않습니다.
-echo.
-echo 지금 Python 설치 페이지를 엽니다.
-echo 설치 화면에서 반드시 "Add python.exe to PATH"를 선택해 주세요.
-echo 설치를 마친 뒤 이 파일을 다시 더블클릭하면 됩니다.
-echo.
+echo Python was not found.
+echo The Python download page will open now.
+echo Select "Add python.exe to PATH" during installation.
+echo Then double-click this file again.
 start "" "https://www.python.org/downloads/windows/"
 pause
-popd
 exit /b 1
 
-:missing_files
+:FILE_ERROR
 cls
-echo 앱 실행에 필요한 파일을 찾을 수 없습니다.
-echo ZIP 파일의 압축을 모두 푼 폴더 안에서 실행해 주세요.
-echo.
+echo Required app files were not found.
+echo Extract the entire ZIP file, then run this file inside that folder.
 pause
-popd
 exit /b 1
 
-:venv_error
+:SETUP_ERROR
 cls
-echo Python 환경을 만들지 못했습니다.
-echo Python을 다시 설치한 뒤 실행해 주세요.
-echo.
+echo Setup failed. Check your internet connection and try again.
+echo If it fails again, send a screenshot of this window.
 pause
-popd
 exit /b 1
 
-:install_error
+:START_ERROR
 cls
-echo 필요한 프로그램 설치 중 오류가 발생했습니다.
-echo 인터넷 연결을 확인한 뒤 이 파일을 다시 더블클릭해 주세요.
-echo.
+echo The app could not start.
+echo Send the "execution error" text file in this folder.
 pause
-popd
-exit /b 1
-
-:launch_error
-cls
-echo 앱을 실행하지 못했습니다.
-echo 프로젝트 폴더의 "실행오류.txt" 파일이 있다면 보내 주세요.
-echo.
-pause
-popd
 exit /b 1
