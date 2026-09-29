@@ -9,7 +9,7 @@ if not exist "windows_launcher.pyw" goto FILE_ERROR
 if not exist ".venv\Scripts\python.exe" goto CREATE_ENV
 
 :CHECK_PACKAGES
-".venv\Scripts\python.exe" -c "import PyQt6; from google import genai; import pdfplumber, pypdf, pytesseract, PIL, reportlab" >nul 2>&1
+".venv\Scripts\python.exe" -c "import PyQt6; from google import genai; import pdfplumber, pypdf, pymupdf, pytesseract, PIL, reportlab" >nul 2>&1
 if not errorlevel 1 goto START_APP
 goto INSTALL_PACKAGES
 

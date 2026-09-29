@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from copy import deepcopy
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, pyqtSignal
@@ -11,8 +12,11 @@ from PyQt6.QtWidgets import (
     QListWidgetItem, QMessageBox, QProgressBar, QPushButton, QVBoxLayout, QWidget,
 )
 
-from ..services.gemini_client import ConnectionTestResult, GeminiError
-from ..services.pdf_parser import ParseResult, PdfParser
+from ..services.analysis_pipeline import AnalysisBatchResult, AnalysisPipeline, passages_equivalent
+from ..services.difficulty import DifficultyClassifier
+from ..services.document_analyzer import GeminiDocumentAnalyzer
+from ..services.gemini_client import ConnectionTestResult, GeminiClient, GeminiError
+from ..services.pdf_parser import PdfParser
 from .state import AppState
 from .styles import difficulty_color
 from .widgets import Card
@@ -21,6 +25,13 @@ from .widgets import Card
 def _repolish(widget: QWidget) -> None:
     widget.style().unpolish(widget)
     widget.style().polish(widget)
+
+
+def _normalized_path(path: str) -> str:
+    try:
+        return str(Path(path).resolve()).casefold()
+    except OSError:
+        return str(Path(path).absolute()).casefold()
 
 
 class PdfDropArea(QLabel):
@@ -44,7 +55,7 @@ class PdfDropArea(QLabel):
         _repolish(self)
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
-        if self._pdf_paths(event):
+        if self.isEnabled() and self._pdf_paths(event):
             event.acceptProposedAction()
             self._set_active(True)
         else:
@@ -63,12 +74,13 @@ class PdfDropArea(QLabel):
 
 class DashboardView(QWidget):
     open_settings_requested = pyqtSignal()
-    analysis_completed = pyqtSignal()        # 분석 후 편집 화면으로 이동할 때 사용
+    analysis_completed = pyqtSignal(str)    # 새로 추가한 첫 지문 ID
 
     def __init__(self, state: AppState, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.state = state
         self._pending_files: list[str] = []
+        self._busy = False
         self._build_ui()
         state.config_changed.connect(self.refresh_api_status)
         state.library_changed.connect(self.refresh_stats)
@@ -145,15 +157,15 @@ class DashboardView(QWidget):
         pdf_card.body.addWidget(self.file_list, 1)
 
         row = QHBoxLayout()
-        add_btn = QPushButton("PDF 추가…")
-        add_btn.clicked.connect(self._browse_files)
-        remove_btn = QPushButton("선택 제거")
-        remove_btn.clicked.connect(self._remove_selected)
+        self.add_btn = QPushButton("PDF 추가…")
+        self.add_btn.clicked.connect(self._browse_files)
+        self.remove_btn = QPushButton("선택 제거")
+        self.remove_btn.clicked.connect(self._remove_selected)
         self.analyze_btn = QPushButton("분석 시작")
         self.analyze_btn.setObjectName("Primary")
         self.analyze_btn.clicked.connect(self._start_analysis)
-        row.addWidget(add_btn)
-        row.addWidget(remove_btn)
+        row.addWidget(self.add_btn)
+        row.addWidget(self.remove_btn)
         row.addStretch()
         row.addWidget(self.analyze_btn)
         pdf_card.body.addLayout(row)
@@ -230,6 +242,8 @@ class DashboardView(QWidget):
 
     # --- 파일 목록 -------------------------------------------------------
     def add_files(self, paths: list[str]) -> None:
+        if self._busy:
+            return
         added = 0
         for path in paths:
             if path in self._pending_files:
@@ -260,27 +274,50 @@ class DashboardView(QWidget):
         self._update_analyze_enabled()
 
     def _update_analyze_enabled(self) -> None:
-        self.analyze_btn.setEnabled(bool(self._pending_files))
+        self.analyze_btn.setEnabled(bool(self._pending_files) and not self._busy)
 
-    # --- 분석 (Step 2 에서 실제 구현) -------------------------------------
+    # --- PDF/OCR/Gemini 통합 분석 -----------------------------------------
     def _start_analysis(self) -> None:
-        cfg = self.state.config
-        parser = PdfParser(cfg.tesseract_cmd, cfg.ocr_languages, cfg.ocr_dpi)
-        files = list(self._pending_files)
+        if self._busy or not self._pending_files:
+            return
+        cfg = deepcopy(self.state.config)  # 분석 중 설정 변경의 영향을 받지 않는 snapshot
+        api_key = self.state.config_manager.effective_api_key
+        files = [Path(path) for path in self._pending_files]
 
         def job(progress):
-            results = []
-            for i, path in enumerate(files, start=1):
-                progress(i - 1, len(files), f"{Path(path).name} 분석 중…")
-                results.append(parser.parse(Path(path)))
-            progress(len(files), len(files), "완료")
-            return results
+            parser = PdfParser(
+                cfg.tesseract_cmd,
+                cfg.ocr_languages,
+                cfg.ocr_dpi,
+                ocr_timeout_sec=getattr(cfg, "ocr_timeout_sec", 90),
+            )
+            analyzer = None
+            classifier = None
+            setup_warning = ""
+            if api_key:
+                try:
+                    client = GeminiClient(
+                        api_key=api_key,
+                        model=cfg.gemini_model,
+                        timeout_sec=cfg.gemini_timeout_sec,
+                        max_retries=cfg.gemini_max_retries,
+                        requests_per_minute=getattr(cfg, "gemini_requests_per_minute", 10),
+                    )
+                    analyzer = GeminiDocumentAnalyzer(client)
+                    classifier = DifficultyClassifier(client)
+                except GeminiError as exc:
+                    setup_warning = f"Gemini 초기화 실패로 로컬 분석만 수행했습니다: {exc}"
+            pipeline = AnalysisPipeline(
+                parser,
+                document_analyzer=analyzer,
+                classifier=classifier,
+            )
+            batch = pipeline.analyze_files(files, progress=progress)
+            if setup_warning:
+                batch.general_warnings.append(setup_warning)
+            return batch
 
-        self.analyze_btn.setEnabled(False)
-        self.progress.setVisible(True)
-        self.progress_label.setVisible(True)
-        self.progress.setRange(0, len(files))
-        self.progress.setValue(0)
+        self._set_analysis_busy(True, len(files) * 1000)
         self.state.run_async(
             job,
             on_progress=self._on_progress,
@@ -289,31 +326,121 @@ class DashboardView(QWidget):
             on_finished=self._on_analysis_finished,
         )
 
+    def _set_analysis_busy(self, busy: bool, maximum: int = 1) -> None:
+        self._busy = busy
+        self.drop_area.setEnabled(not busy)
+        self.file_list.setEnabled(not busy)
+        self.add_btn.setEnabled(not busy)
+        self.remove_btn.setEnabled(not busy)
+        self.analyze_btn.setText("분석 중…" if busy else "분석 시작")
+        self.progress.setVisible(busy)
+        self.progress_label.setVisible(busy)
+        if busy:
+            self.progress.setRange(0, max(1, maximum))
+            self.progress.setValue(0)
+            self.progress_label.setText("분석 준비 중…")
+        self._update_analyze_enabled()
+
     def _on_progress(self, current: int, total: int, message: str) -> None:
         self.progress.setMaximum(max(total, 1))
-        self.progress.setValue(current)
+        self.progress.setValue(max(0, min(current, total)))
         self.progress_label.setText(message)
 
-    def _on_analysis_done(self, results: list[ParseResult]) -> None:
-        count = 0
-        for result in results:
+    def _on_analysis_done(self, batch: AnalysisBatchResult) -> None:
+        known_passages = list(self.state.library.passages)
+        added_passages = []
+        duplicate_count = 0
+        for result in batch.results:
             for passage in result.passages:
+                if any(passages_equivalent(existing, passage) for existing in known_passages):
+                    duplicate_count += 1
+                    continue
+                known_passages.append(passage)
                 self.state.library.add_passage(passage)
-                count += 1
+                added_passages.append(passage)
             self.state.config_manager.add_recent_file(result.source_file)
-        self._pending_files.clear()
+
+        # 성공한 파일만 대기 목록에서 제거하고 실패 파일은 재시도할 수 있게 남긴다.
+        successful = {_normalized_path(path) for path in batch.successful_paths}
+        self._pending_files = [
+            path for path in self._pending_files if _normalized_path(path) not in successful
+        ]
+        self._rebuild_file_list()
+
+        warnings = list(batch.warnings)
+        if duplicate_count:
+            warnings.append(f"이미 라이브러리에 있는 중복 지문 {duplicate_count}개는 추가하지 않았습니다.")
+
+        if batch.results:
+            try:
+                self.state.config_manager.save()
+            except OSError as exc:
+                warnings.append(f"최근 파일 설정 저장 실패: {exc}")
+
+        if added_passages:
+            self.state.mark_dirty()
+            try:
+                self.state.save_library()  # 분석 직후 자동 저장하여 결과 유실 방지
+            except OSError as exc:
+                warnings.append(f"자동 저장 실패: {exc}. Ctrl+S로 다시 저장해 주세요.")
+            question_count = sum(len(passage.questions) for passage in added_passages)
+            self.state.status(
+                f"분석 완료: 지문 {len(added_passages)}개, 문제 {question_count}개",
+                7000,
+            )
+        elif batch.failures:
+            self.state.status("PDF 분석에 실패했습니다. 상세 내용을 확인해 주세요.", 7000)
+        else:
+            self.state.status("새로 추가할 지문이 없습니다.", 5000)
+
+        self._show_analysis_summary(batch, added_passages, duplicate_count, warnings)
+        if added_passages:
+            self.analysis_completed.emit(added_passages[0].id)
+
+    def _rebuild_file_list(self) -> None:
         self.file_list.clear()
-        self.state.mark_dirty()
-        self.state.status(f"지문 {count}개를 추출했습니다.")
-        self.analysis_completed.emit()
+        for path in self._pending_files:
+            item = QListWidgetItem(Path(path).name)
+            item.setToolTip(path)
+            item.setData(Qt.ItemDataRole.UserRole, path)
+            self.file_list.addItem(item)
+
+    def _show_analysis_summary(
+        self,
+        batch: AnalysisBatchResult,
+        added_passages: list,
+        duplicate_count: int,
+        warnings: list[str],
+    ) -> None:
+        question_count = sum(len(passage.questions) for passage in added_passages)
+        ocr_pages = sum(result.ocr_page_count for result in batch.results)
+        ai_files = sum(result.used_ai for result in batch.results)
+        box = QMessageBox(self)
+        box.setWindowTitle("PDF 분석 결과")
+        box.setIcon(
+            QMessageBox.Icon.Warning if batch.failures or warnings else QMessageBox.Icon.Information
+        )
+        box.setText(
+            f"지문 {len(added_passages)}개와 문제 {question_count}개를 라이브러리에 추가했습니다."
+        )
+        details = [
+            f"성공 파일: {len(batch.results)}개",
+            f"실패 파일: {len(batch.failures)}개",
+            f"OCR 사용 페이지: {ocr_pages}개",
+            f"Gemini 교차 분석 파일: {ai_files}개",
+            f"중복 제외 지문: {duplicate_count}개",
+        ]
+        box.setInformativeText("\n".join(details))
+        if warnings:
+            box.setDetailedText("\n".join(f"• {warning}" for warning in warnings))
+        box.exec()
 
     def _on_analysis_error(self, exc: Exception) -> None:
-        if isinstance(exc, NotImplementedError):
-            QMessageBox.information(self, "분석", f"{exc}\n\n지금은 '편집·검수' 화면에서 지문을 직접 입력할 수 있습니다.")
-        else:
-            QMessageBox.critical(self, "분석 오류", str(exc))
+        QMessageBox.critical(
+            self,
+            "분석 오류",
+            f"분석 작업을 시작하지 못했습니다.\n\n{exc}\n\n오류 화면을 캡처해 보내 주세요.",
+        )
 
     def _on_analysis_finished(self) -> None:
-        self.progress.setVisible(False)
-        self.progress_label.setVisible(False)
-        self._update_analyze_enabled()
+        self._set_analysis_busy(False)

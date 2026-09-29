@@ -49,6 +49,7 @@ class AppState(QObject):
             model=model or cfg.gemini_model,
             timeout_sec=cfg.gemini_timeout_sec,
             max_retries=cfg.gemini_max_retries,
+            requests_per_minute=cfg.gemini_requests_per_minute,
         )
 
     # --- 라이브러리 -----------------------------------------------------

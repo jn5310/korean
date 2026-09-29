@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import html
+from copy import deepcopy
 from typing import Optional
 
 from PyQt6.QtCore import Qt, QTimer
@@ -19,6 +20,8 @@ from PyQt6.QtWidgets import (
 
 from ..config import DEFAULT_PASSAGE_TYPES, DEFAULT_QUESTION_TYPES, DIFFICULTY_LEVELS
 from ..models import Passage, Question
+from ..services.difficulty import DifficultyClassifier
+from ..services.gemini_client import GeminiError
 from .state import AppState
 from .styles import difficulty_color
 from .widgets import DifficultyCombo, difficulty_badge_html, make_type_combo
@@ -58,6 +61,7 @@ class EditorView(QWidget):
         self._loading = False
         self._current: Optional[Passage] = None
         self._current_q: Optional[Question] = None
+        self._ai_busy = False
 
         self._preview_timer = QTimer(self)
         self._preview_timer.setSingleShot(True)
@@ -66,6 +70,7 @@ class EditorView(QWidget):
 
         self._build_ui()
         state.library_changed.connect(self.reload_list)
+        state.config_changed.connect(self._refresh_ai_button)
         self.reload_list()
 
     # ================================================================ UI
@@ -130,7 +135,8 @@ class EditorView(QWidget):
         self.pdiff_combo.currentIndexChanged.connect(self._on_passage_difficulty_changed)
         self.ai_btn = QPushButton("AI 난이도 판별")
         self.ai_btn.setEnabled(False)
-        self.ai_btn.setToolTip("Step 3 에서 구현 예정")
+        self.ai_btn.clicked.connect(self._analyze_current_with_ai)
+        self.ai_btn.setToolTip("현재 지문과 모든 문항의 난이도·유형을 Gemini로 다시 분석합니다.")
         meta.addWidget(QLabel("유형"))
         meta.addWidget(self.ptype_combo, 1)
         meta.addWidget(QLabel("난이도"))
@@ -219,6 +225,20 @@ class EditorView(QWidget):
         return w
 
     # ========================================================= 목록
+    def select_passage(self, passage_id: str) -> None:
+        """분석 직후 필터를 초기화하고 새 지문을 선택한다."""
+        passage = self.state.library.get_passage(passage_id)
+        if passage is None:
+            return
+        self.search_edit.blockSignals(True)
+        self.search_edit.clear()
+        self.search_edit.blockSignals(False)
+        self.diff_filter.blockSignals(True)
+        self.diff_filter.setCurrentIndex(0)
+        self.diff_filter.blockSignals(False)
+        self._current = passage
+        self.reload_list()
+
     def _passage_item_text(self, p: Passage) -> str:
         lv = f"Lv.{p.difficulty}" if p.difficulty else "미분류"
         return f"[{lv}] {p.display_title}  ({len(p.questions)}문항)"
@@ -270,6 +290,7 @@ class EditorView(QWidget):
         for w in (self.title_edit, self.ptype_combo, self.pdiff_combo, self.text_edit,
                   self.question_list, self.del_btn):
             w.setEnabled(enabled)
+        self._refresh_ai_button()
         self.title_edit.setText(p.title if p else "")
         self.ptype_combo.setCurrentText(p.passage_type if p else "")
         self.pdiff_combo.set_value(p.difficulty if p else None)
@@ -304,6 +325,68 @@ class EditorView(QWidget):
         self._current.difficulty_source = "manual"
         self._current.touch()
         self._after_edit()
+
+    def _refresh_ai_button(self) -> None:
+        available = self._current is not None and self.state.has_api_key and not self._ai_busy
+        self.ai_btn.setEnabled(available)
+        if not self.state.has_api_key:
+            self.ai_btn.setToolTip("대시보드 또는 설정에서 Gemini API Key를 먼저 설정하세요.")
+        else:
+            self.ai_btn.setToolTip("현재 지문과 모든 문항의 난이도·유형을 Gemini로 다시 분석합니다.")
+
+    def _analyze_current_with_ai(self) -> None:
+        if not self._current or self._ai_busy:
+            return
+        try:
+            client = self.state.create_gemini_client()
+        except GeminiError as exc:
+            QMessageBox.warning(self, "AI 난이도 판별", str(exc))
+            return
+        snapshot = deepcopy(self._current)
+        classifier = DifficultyClassifier(client)
+        self._ai_busy = True
+        self.ai_btn.setText("AI 분석 중…")
+        self._refresh_ai_button()
+        self.state.run_async(
+            classifier.classify,
+            snapshot,
+            on_result=self._apply_ai_analysis,
+            on_error=lambda exc: QMessageBox.warning(self, "AI 난이도 판별 실패", str(exc)),
+            on_finished=self._finish_ai_analysis,
+        )
+
+    def _apply_ai_analysis(self, analyzed: Passage) -> None:
+        target = self.state.library.get_passage(analyzed.id)
+        if target is None:
+            return
+        target.difficulty = analyzed.difficulty
+        target.difficulty_source = analyzed.difficulty_source
+        target.difficulty_reason = analyzed.difficulty_reason
+        target.passage_type = analyzed.passage_type
+        analyzed_questions = {question.id: question for question in analyzed.questions}
+        for question in target.questions:
+            source = analyzed_questions.get(question.id)
+            if source:
+                question.difficulty = source.difficulty
+                question.difficulty_source = source.difficulty_source
+                question.question_type = source.question_type
+        target.touch()
+        self.state.mark_dirty()
+        try:
+            self.state.save_library()
+        except OSError as exc:
+            QMessageBox.warning(self, "저장 실패", f"AI 분석은 적용됐지만 자동 저장하지 못했습니다.\n{exc}")
+        self._show_passage(target)
+        QMessageBox.information(
+            self,
+            "AI 난이도 판별",
+            f"지문과 문항 {len(target.questions)}개의 난이도·유형 분석을 완료했습니다.",
+        )
+
+    def _finish_ai_analysis(self) -> None:
+        self._ai_busy = False
+        self.ai_btn.setText("AI 난이도 판별")
+        self._refresh_ai_button()
 
     def _after_edit(self) -> None:
         self.state.mark_dirty(notify_library=False)

@@ -28,8 +28,22 @@ python main.py
 - Python 3.10 이상
 - Gemini API Key: [Google AI Studio](https://aistudio.google.com/apikey) 에서 무료 발급 → 앱의 **설정(Ctrl+,)** 에 입력
   (또는 환경변수 `GEMINI_API_KEY`)
-- 스캔본 OCR(Step 2)에는 [Tesseract](https://github.com/tesseract-ocr/tesseract) 와 한국어 데이터(`kor`)가 필요합니다.
+- 텍스트 PDF는 추가 설치 없이 읽습니다. 스캔본은 Tesseract가 있으면 로컬 OCR을 사용하고,
+  없더라도 API Key가 설정되어 있으면 13MB 이하 PDF를 Gemini 문서 비전으로 직접 분석합니다.
+- 로컬 스캔 OCR을 사용하려면 [Tesseract](https://github.com/tesseract-ocr/tesseract)와 한국어 데이터(`kor`)를 설치하고 설정에서 경로를 지정하세요.
 - Windows에서 앱이 열리지 않으면 프로젝트 폴더의 `실행오류.txt`를 확인하세요.
+
+## PDF 분석 사용법
+
+1. 대시보드에서 PDF를 끌어다 놓거나 **PDF 추가…**로 선택합니다.
+2. **분석 시작**을 누릅니다. 같은 화면에서 페이지 추출 → OCR → 지문/오지선다 복원 → Gemini 교차 검토가 순서대로 실행됩니다.
+3. 완료 창에서 성공·실패 파일, OCR 페이지, AI 사용 여부와 상세 경고를 확인합니다.
+4. 성공하면 결과가 자동 저장되고 **편집·검수** 화면으로 이동합니다.
+
+분석기는 내장 텍스트와 OCR 중 품질이 높은 결과를 선택하고, 반복 머리말·꼬리말을 제거합니다.
+`[1~3] 다음 글을 읽고 물음에 답하시오` 같은 범위와 문항 번호, ①~⑤를 결합해 지문과 문제를 묶습니다.
+Gemini가 전체 문맥과 시각적 PDF를 다시 검토하되, 원문 일치도와 문항 수를 로컬 결과와 비교해 더 완전한 구조만 채택합니다.
+API 오류가 발생해도 로컬 추출 결과는 유지되며, 같은 PDF를 다시 분석해도 내용이 같은 지문은 중복 추가되지 않습니다.
 
 > PRD 에는 `google-generativeai` 로 되어 있으나 해당 패키지는 지원 종료(deprecated)되어,
 > Google 이 권장하는 후속 SDK 인 `google-genai` 를 사용합니다.
@@ -45,9 +59,12 @@ app/
 ├── models.py               # Passage(지문) 1:N Question(문제), ExamSet(시험지), Library
 ├── storage.py              # 라이브러리 JSON 저장/불러오기(원자적 저장)
 ├── services/               # ── Qt 비의존 비즈니스 로직
-│   ├── gemini_client.py    # [Step 1] Gemini 연동 (재시도·RPM 제한·JSON 모드)
-│   ├── pdf_parser.py       # [Step 2] 텍스트 추출 + OCR + 지문/문제 파싱   (인터페이스)
-│   ├── difficulty.py       # [Step 3] AI 난이도 판별                       (인터페이스)
+│   ├── analysis_pipeline.py # PDF→OCR→구조→AI 통합·부분 성공·중복 방지
+│   ├── pdf_parser.py       # 텍스트 추출 + 품질 판정 + 스캔 OCR
+│   ├── structure_parser.py # 지문 뒤 오지선다 문제 규칙 기반 복원
+│   ├── document_analyzer.py# Gemini 문서 구조 교차 검토·PDF 비전
+│   ├── difficulty.py       # AI 난이도(1~5)·유형 분석
+│   ├── gemini_client.py    # Gemini 연동 (재시도·RPM 제한·JSON/PDF 모드)
 │   └── pdf_exporter.py     # [Step 5] 1지문-1페이지 PDF 출판               (인터페이스)
 └── ui/                     # ── PyQt6 화면
     ├── main_window.py      # 내비게이션 · 메뉴 · 상태표시줄
@@ -69,10 +86,11 @@ Linux `~/.local/share/korean-studio`). `STUDIO_DATA_DIR` 환경변수로 변경�
 | 단계 | 내용 | 상태 |
 |---|---|---|
 | Step 1 | GUI 기본 틀 + Gemini API 연동 모듈 | ✅ 완료 |
-| Step 2 | PDF 텍스트 추출 + OCR + 지문/문제 파싱 | ⏳ 인터페이스만 |
-| Step 3 | Gemini 난이도(1~5) 자동 판별 · JSON 구조화 | ⏳ 인터페이스만 |
-| Step 4 | 편집기 · 필터링 · 시험지 구성 고도화 | 🔶 기본 동작 구현 |
+| Step 2 | PDF 텍스트 추출 + OCR + 지문/오지선다 파싱 | ✅ 완료 |
+| Step 3 | Gemini 구조 교차 검토 + 난이도(1~5)·유형 분석 | ✅ 완료 |
+| Step 4 | 편집기 · 필터링 · 시험지 구성 | ✅ 기본 동작 + AI 재분석 |
 | Step 5 | ReportLab 1지문-1페이지 PDF 내보내기 | ⏳ 인터페이스만 |
 
-Step 1 에서 동작하는 것: 설정 저장, API Key 연결 테스트, 모델 목록 불러오기, PDF 파일 등록(분석은 Step 2),
-지문/문제 수동 입력·수정·삭제, 난이도/유형 수동 지정, 조건별 필터, 시험지 구성(담기·드래그 정렬), JSON 저장/가져오기.
+현재 동작하는 것: 설정 저장, API Key 연결 테스트, 모델 목록 불러오기, 텍스트/스캔 PDF 분석,
+지문 뒤 오지선다 문제 자동 복원, Gemini 구조 교차 검토·난이도/유형 판별, 파일별 부분 성공과 결과 자동 저장,
+지문/문제 수동 입력·수정·삭제, 선택 지문 AI 재분석, 조건별 필터, 시험지 구성(담기·드래그 정렬), JSON 저장/가져오기.

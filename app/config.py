@@ -51,6 +51,14 @@ ENV_API_KEY = "GEMINI_API_KEY"
 ENV_DATA_DIR = "STUDIO_DATA_DIR"
 
 
+def _bounded_int(value, default: int, minimum: int, maximum: int) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = default
+    return max(minimum, min(maximum, number))
+
+
 def default_data_dir() -> Path:
     override = os.environ.get(ENV_DATA_DIR)
     if override:
@@ -69,18 +77,35 @@ class AppConfig:
     gemini_model: str = DEFAULT_GEMINI_MODEL
     gemini_timeout_sec: int = 60
     gemini_max_retries: int = 3
+    gemini_requests_per_minute: int = 10
     # OCR (Step 2)
     tesseract_cmd: str = ""          # 비어 있으면 PATH 에서 탐색
     ocr_languages: str = "kor+eng"
     ocr_dpi: int = 300
+    ocr_timeout_sec: int = 90
     # UI
     last_open_dir: str = ""
     recent_files: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict) -> "AppConfig":
+        if not isinstance(data, dict):
+            return cls()
         known = {f.name for f in fields(cls)}
         return cls(**{k: v for k, v in data.items() if k in known})
+
+    def __post_init__(self) -> None:
+        self.gemini_api_key = self.gemini_api_key if isinstance(self.gemini_api_key, str) else ""
+        self.gemini_model = self.gemini_model if isinstance(self.gemini_model, str) and self.gemini_model else DEFAULT_GEMINI_MODEL
+        self.gemini_timeout_sec = _bounded_int(self.gemini_timeout_sec, 60, 10, 600)
+        self.gemini_max_retries = _bounded_int(self.gemini_max_retries, 3, 0, 10)
+        self.gemini_requests_per_minute = _bounded_int(self.gemini_requests_per_minute, 10, 1, 60)
+        self.tesseract_cmd = self.tesseract_cmd if isinstance(self.tesseract_cmd, str) else ""
+        self.ocr_languages = self.ocr_languages if isinstance(self.ocr_languages, str) and self.ocr_languages else "kor+eng"
+        self.ocr_dpi = _bounded_int(self.ocr_dpi, 300, 150, 600)
+        self.ocr_timeout_sec = _bounded_int(self.ocr_timeout_sec, 90, 10, 600)
+        self.last_open_dir = self.last_open_dir if isinstance(self.last_open_dir, str) else ""
+        self.recent_files = [str(path) for path in self.recent_files] if isinstance(self.recent_files, list) else []
 
     def to_dict(self) -> dict:
         return asdict(self)

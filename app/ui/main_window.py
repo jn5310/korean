@@ -60,7 +60,7 @@ class MainWindow(QMainWindow):
         self.nav.setCurrentRow(PAGE_DASHBOARD)
 
         self.dashboard.open_settings_requested.connect(self.open_settings)
-        self.dashboard.analysis_completed.connect(lambda: self.nav.setCurrentRow(PAGE_EDITOR))
+        self.dashboard.analysis_completed.connect(self._show_analyzed_passage)
         self.setCentralWidget(central)
 
     def _build_menu(self) -> None:
@@ -99,6 +99,10 @@ class MainWindow(QMainWindow):
         self.api_indicator = QLabel()
         self.api_indicator.setContentsMargins(8, 0, 8, 0)
         self.statusBar().addPermanentWidget(self.api_indicator)
+
+    def _show_analyzed_passage(self, passage_id: str) -> None:
+        self.nav.setCurrentRow(PAGE_EDITOR)
+        self.editor.select_passage(passage_id)
 
     # ------------------------------------------------------------------
     def _update_title(self, *_args) -> None:

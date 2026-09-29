@@ -90,12 +90,30 @@ def extract_json(text: str) -> Any:
     raise GeminiError("모델 응답을 JSON 으로 해석할 수 없습니다.")
 
 
+def _extract_status_code(exc: Exception) -> Optional[int]:
+    """google-genai/httpx 버전별 예외 형태에서 HTTP 상태 코드를 찾는다."""
+    candidates = [
+        getattr(exc, "code", None),
+        getattr(exc, "status_code", None),
+        getattr(getattr(exc, "response", None), "status_code", None),
+    ]
+    for value in candidates:
+        if hasattr(value, "value"):
+            value = value.value
+        try:
+            code = int(value)
+        except (TypeError, ValueError):
+            continue
+        if 100 <= code <= 599:
+            return code
+    return None
+
+
 def _friendly_error(exc: Exception) -> GeminiError:
     """SDK/네트워크 예외 → 한국어 GeminiError 변환."""
     if isinstance(exc, GeminiError):
         return exc
-    code = getattr(exc, "code", None)
-    code = code if isinstance(code, int) else None
+    code = _extract_status_code(exc)
     raw = str(exc)
     lowered = raw.lower()
 
@@ -206,7 +224,23 @@ class GeminiClient:
         system_instruction: Optional[str] = None,
         temperature: Optional[float] = 0.2,
     ) -> Any:
-        """JSON 모드로 호출하고 파싱된 객체를 반환한다 (Step 3 난이도 판별에서 사용)."""
+        """JSON 모드로 호출하고 파싱된 객체를 반환한다."""
+        return self.generate_json_from_contents(
+            prompt,
+            schema=schema,
+            system_instruction=system_instruction,
+            temperature=temperature,
+        )
+
+    def generate_json_from_contents(
+        self,
+        contents: Any,
+        *,
+        schema: Optional[dict] = None,
+        system_instruction: Optional[str] = None,
+        temperature: Optional[float] = 0.2,
+    ) -> Any:
+        """텍스트 또는 멀티모달 contents를 구조화 JSON으로 생성한다."""
         config = self._make_config(
             system_instruction=system_instruction,
             temperature=temperature,
@@ -215,10 +249,52 @@ class GeminiClient:
         )
 
         def call():
-            resp = self._client.models.generate_content(model=self.model, contents=prompt, config=config)
+            resp = self._client.models.generate_content(
+                model=self.model,
+                contents=contents,
+                config=config,
+            )
             return extract_json(resp.text)
 
         return self._call_with_retry(call)
+
+    def generate_pdf_json(
+        self,
+        pdf_path,
+        prompt: str,
+        *,
+        schema: Optional[dict] = None,
+        system_instruction: Optional[str] = None,
+        temperature: Optional[float] = 0.1,
+        max_inline_bytes: int = 13 * 1024 * 1024,
+    ) -> Any:
+        """Gemini 네이티브 문서 비전으로 PDF를 직접 분석한다.
+
+        Base64 변환과 요청 메타데이터 여유를 두기 위해 원본을 13MB로 제한한다.
+        그보다 큰 스캔 PDF는 로컬 Tesseract OCR 또는 파일 분할이 필요하다.
+        """
+        from pathlib import Path
+
+        path = Path(pdf_path)
+        if not path.exists():
+            raise GeminiError(f"PDF 파일을 찾을 수 없습니다: {path}")
+        size = path.stat().st_size
+        if size > max_inline_bytes:
+            raise GeminiError(
+                f"PDF가 {size / 1024 / 1024:.1f}MB로 너무 큽니다. "
+                "13MB 이하로 나누거나 Tesseract OCR을 설정해 주세요."
+            )
+        data = path.read_bytes()
+        if self._types is None:
+            part = {"inline_data": {"mime_type": "application/pdf", "data": data}}
+        else:
+            part = self._types.Part.from_bytes(data=data, mime_type="application/pdf")
+        return self.generate_json_from_contents(
+            [part, prompt],
+            schema=schema,
+            system_instruction=system_instruction,
+            temperature=temperature,
+        )
 
     def list_models(self) -> list[str]:
         """generateContent 를 지원하는 모델 ID 목록."""
