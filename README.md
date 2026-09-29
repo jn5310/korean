@@ -3,7 +3,20 @@
 PDF(텍스트/스캔본)에서 지문과 문제를 추출하고, Gemini API 로 난이도(1~5단계)를 자동 분류한 뒤,
 직접 편집하여 **1지문-1페이지** 교재와 맞춤형 시험지를 PDF 로 출판하는 PyQt6 데스크톱 프로그램입니다.
 
-## 실행
+## 가장 쉬운 실행 방법 (Windows)
+
+명령 프롬프트에 아무것도 입력할 필요가 없습니다.
+
+1. GitHub의 **Code → Download ZIP**으로 받은 파일의 압축을 풉니다.
+2. 압축을 푼 폴더에서 **`실행하기.bat`**를 더블클릭합니다.
+3. 처음 한 번은 필요한 프로그램을 자동으로 설치합니다. 설치가 끝나면 앱이 자동으로 열립니다.
+4. 다음부터는 **`실행하기.bat`**만 더블클릭하면 바로 실행됩니다.
+
+> Windows에서 보호 경고가 나오면 **추가 정보 → 실행**을 선택하세요.
+> Python이 없으면 실행 파일이 공식 설치 페이지를 자동으로 엽니다. Python 설치 화면에서는
+> **Add python.exe to PATH**를 선택하고, 설치 후 `실행하기.bat`를 다시 더블클릭하세요.
+
+## macOS·Linux 또는 수동 실행
 
 ```bash
 python -m venv .venv
@@ -16,6 +29,7 @@ python main.py
 - Gemini API Key: [Google AI Studio](https://aistudio.google.com/apikey) 에서 무료 발급 → 앱의 **설정(Ctrl+,)** 에 입력
   (또는 환경변수 `GEMINI_API_KEY`)
 - 스캔본 OCR(Step 2)에는 [Tesseract](https://github.com/tesseract-ocr/tesseract) 와 한국어 데이터(`kor`)가 필요합니다.
+- Windows에서 앱이 열리지 않으면 프로젝트 폴더의 `실행오류.txt`를 확인하세요.
 
 > PRD 에는 `google-generativeai` 로 되어 있으나 해당 패키지는 지원 종료(deprecated)되어,
 > Google 이 권장하는 후속 SDK 인 `google-genai` 를 사용합니다.
@@ -24,6 +38,8 @@ python main.py
 
 ```
 main.py                     # 진입점
+실행하기.bat                # Windows 원클릭 설치·실행
+windows_launcher.pyw        # Windows 오류 안내 GUI 실행기
 app/
 ├── config.py               # 설정(JSON) · 난이도/유형 상수
 ├── models.py               # Passage(지문) 1:N Question(문제), ExamSet(시험지), Library
